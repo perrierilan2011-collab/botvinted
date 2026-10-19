@@ -1,8 +1,14 @@
 """
 Bot Vinted -> Discord
-- /setup (admin) : poste le panneau dans un salon
-- Chaque membre crée ses "salons" privés (ex : Nike Tech, Running...) avec ses propres filtres
-- Chaque salon a son webhook, les annonces arrivent avec photos, infos et bouton Acheter
+
+- /setup   (owner/admin)  : menu de configuration (rôles Owner / VIP / Premium+, limite VIP)
+                            + bouton pour poster le panneau public dans un salon
+- /vip     (rôle VIP)     : gérer ses salons Vinted, avec une LIMITE de salons (réglable dans /setup)
+- /premium (rôle Premium+): gérer ses salons Vinted, SANS limite
+- Owner / admins          : aucune limite
+
+Chaque membre crée ses "salons" privés (ex : Nike Tech, Running...) avec ses propres filtres.
+Chaque salon a son webhook, les annonces arrivent avec photos, infos et bouton Acheter.
 """
 import asyncio
 import json
@@ -12,7 +18,6 @@ import re
 import sqlite3
 import time
 import unicodedata
-from datetime import datetime, timezone
 
 import aiohttp
 import discord
@@ -20,14 +25,17 @@ from discord import app_commands
 from dotenv import load_dotenv
 
 load_dotenv()
+
 TOKEN = os.getenv("DISCORD_TOKEN")
 GUILD_ID = int(os.getenv("GUILD_ID") or 0)
 POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "3"))
 PROXY = os.getenv("PROXY") or None
-MAX_SALONS = min(int(os.getenv("MAX_SALONS_PER_USER", "5")), 25)
+# Limite VIP par défaut (modifiable ensuite dans /setup, par serveur)
+DEFAULT_VIP_LIMIT = int(os.getenv("MAX_SALONS_PER_USER", "5"))
 CATEGORY_NAME = os.getenv("CATEGORY_NAME", "🛒 Vinted")
 DB_PATH = os.getenv("DB_PATH", "vinted_bot.db")
 FETCH_DETAILS = os.getenv("FETCH_DETAILS", "0") == "1"
+PAGE_SIZE = 25  # un menu déroulant Discord = 25 choix max -> on pagine
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("vinted")
@@ -39,6 +47,7 @@ COUNTRIES = {
     "it": "🇮🇹 Italie", "nl": "🇳🇱 Pays-Bas", "pl": "🇵🇱 Pologne", "pt": "🇵🇹 Portugal",
     "lu": "🇱🇺 Luxembourg", "at": "🇦🇹 Autriche", "cz": "🇨🇿 Tchéquie", "lt": "🇱🇹 Lituanie",
 }
+TIER_LABEL = {"owner": "👑 Owner", "premium": "💎 Premium+", "vip": "⭐ VIP"}
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
 
@@ -87,6 +96,7 @@ def slugify(text: str) -> str:
 
 # ───────────────────────── Base de données ─────────────────────────
 LIST_FIELDS = ("keywords", "excluded", "brands", "sizes", "conditions")
+CFG_FIELDS = ("owner_role_id", "vip_role_id", "premium_role_id", "vip_limit")
 
 
 class DB:
@@ -106,6 +116,13 @@ class DB:
             self.c.execute("ALTER TABLE salons ADD COLUMN max_age INTEGER DEFAULT 0")
         except sqlite3.OperationalError:
             pass  # colonne déjà présente
+        # Configuration par serveur (rôles + limite VIP), réglée via /setup
+        self.c.execute("""CREATE TABLE IF NOT EXISTS guild_config(
+            guild_id INTEGER PRIMARY KEY,
+            owner_role_id INTEGER,
+            vip_role_id INTEGER,
+            premium_role_id INTEGER,
+            vip_limit INTEGER DEFAULT 5)""")
         self.c.commit()
 
     @staticmethod
@@ -117,6 +134,28 @@ class DB:
             d[f] = json.loads(d[f] or "[]")
         return d
 
+    # --- config serveur ---
+    def get_cfg(self, guild_id) -> dict:
+        row = self.c.execute("SELECT * FROM guild_config WHERE guild_id=?", (guild_id,)).fetchone()
+        if row is None:
+            return {"guild_id": guild_id, "owner_role_id": None, "vip_role_id": None,
+                    "premium_role_id": None, "vip_limit": DEFAULT_VIP_LIMIT}
+        d = dict(row)
+        if d.get("vip_limit") is None:
+            d["vip_limit"] = DEFAULT_VIP_LIMIT
+        return d
+
+    def set_cfg(self, guild_id, **f):
+        f = {k: v for k, v in f.items() if k in CFG_FIELDS}
+        if not f:
+            return
+        self.c.execute("INSERT OR IGNORE INTO guild_config(guild_id, vip_limit) VALUES(?, ?)",
+                       (guild_id, DEFAULT_VIP_LIMIT))
+        sets = ",".join(f"{k}=?" for k in f)
+        self.c.execute(f"UPDATE guild_config SET {sets} WHERE guild_id=?", [*f.values(), guild_id])
+        self.c.commit()
+
+    # --- salons ---
     def add(self, **f) -> int:
         for k in LIST_FIELDS:
             if k in f:
@@ -151,6 +190,35 @@ class DB:
 
 
 db = DB(DB_PATH)
+
+
+# ───────────────────────── Rôles & limites ─────────────────────────
+def has_role(member, role_id) -> bool:
+    return bool(role_id) and hasattr(member, "get_role") and member.get_role(int(role_id)) is not None
+
+
+def is_owner(member) -> bool:
+    """Owner = administrateur du serveur OU membre du rôle Owner configuré dans /setup."""
+    perms = getattr(member, "guild_permissions", None)
+    if perms is None:
+        return False
+    if perms.administrator:
+        return True
+    return has_role(member, db.get_cfg(member.guild.id)["owner_role_id"])
+
+
+def access(member):
+    """Retourne (niveau, limite). limite = None -> illimité. niveau = None -> aucun accès."""
+    if getattr(member, "guild", None) is None:
+        return None, 0
+    if is_owner(member):
+        return "owner", None
+    cfg = db.get_cfg(member.guild.id)
+    if has_role(member, cfg["premium_role_id"]):
+        return "premium", None
+    if has_role(member, cfg["vip_role_id"]):
+        return "vip", int(cfg["vip_limit"])
+    return None, 0
 
 
 # ───────────────────────── Client Vinted ─────────────────────────
@@ -192,7 +260,7 @@ def norm_item(it: dict, domain: str) -> dict:
         ts = it.get("created_at_ts") or it.get("created_at")
     try:
         ts = int(float(ts)) if ts else None
-        if ts and ts > 10**11:      # millisecondes -> secondes
+        if ts and ts > 10**11:  # millisecondes -> secondes
             ts //= 1000
     except (TypeError, ValueError):
         ts = None
@@ -214,7 +282,7 @@ ENDPOINTS = [
     "https://www.vinted.{d}/svc-catalogue/items",
     "https://www.vinted.{d}/api/v2/catalog/items",
 ]
-if os.getenv("VINTED_API_URL"):          # ex : https://api.vinted.{d}/svc-catalogue/items
+if os.getenv("VINTED_API_URL"):  # ex : https://api.vinted.{d}/svc-catalogue/items
     ENDPOINTS.insert(0, os.getenv("VINTED_API_URL"))
 
 
@@ -376,7 +444,6 @@ def build_message(s: dict, it: dict, extra: dict | None):
         if rep is not None:
             rating = f"⭐ {float(rep) * 5:.1f}/5" + (f" ({cnt} avis)" if cnt else "")
     photos = [p for p in photos if p][:4]
-
     price = f"{it['price']:.2f} {it['currency']}".replace("EUR", "€") if it["price"] is not None else "?"
     e = discord.Embed(title=it["title"][:250], url=it["url"], color=COLOR)
     e.add_field(name="💶 Prix", value=f"**{price}**", inline=True)
@@ -397,7 +464,6 @@ def build_message(s: dict, it: dict, extra: dict | None):
     # Astuce Discord : plusieurs embeds avec la même URL = galerie de photos
     for p in photos[1:]:
         embeds.append(discord.Embed(url=it["url"], color=COLOR).set_image(url=p))
-
     view = discord.ui.View()
     view.add_item(discord.ui.Button(label="🛒 Acheter", url=it["url"], style=discord.ButtonStyle.link))
     if it["seller_url"]:
@@ -406,27 +472,53 @@ def build_message(s: dict, it: dict, extra: dict | None):
 
 
 # ───────────────────────── Menus (interface) ─────────────────────────
-def main_payload(user, guild_id):
+def main_payload(user, guild_id, page=0):
+    tier, limit = access(user)
     salons = db.by_user(user.id, guild_id)
+    pages = max(1, -(-len(salons) // PAGE_SIZE))
+    page = min(max(page, 0), pages - 1)
+    chunk = salons[page * PAGE_SIZE:(page + 1) * PAGE_SIZE]
+
+    if tier is None:
+        quota = "*⚠️ Tu n'as plus de rôle qui permet de créer des salons.*"
+    elif limit is None:
+        quota = f"*{TIER_LABEL[tier]} • salons **illimités** ({len(salons)} actuellement).*"
+    else:
+        quota = f"*{TIER_LABEL[tier]} • **{len(salons)}/{limit}** salons utilisés.*"
+
     e = discord.Embed(title="📂 Tes salons Vinted", color=COLOR)
     e.description = (
         "Un **salon** = une recherche avec son propre salon privé.\n"
         "Exemple : un salon **Nike Tech**, un autre **Running**, etc. Rien n'est mélangé !\n\n"
         + ("**Tes salons :**\n" + "\n".join(
-            f"{'🟢' if s['active'] else '⏸️'} **{s['name']}** → <#{s['channel_id']}>" for s in salons)
-           if salons else "Tu n'as pas encore de salon. Clique sur **➕ Nouveau salon** pour commencer.")
-        + f"\n\n*Tu peux avoir jusqu'à {MAX_SALONS} salons.*"
+            f"{'🟢' if s['active'] else '⏸️'} **{s['name']}** → <#{s['channel_id']}>" for s in chunk)
+           if chunk else "Tu n'as pas encore de salon. Clique sur **➕ Nouveau salon** pour commencer.")
+        + f"\n\n{quota}"
     )
-    return e, MainView(user, guild_id, salons)
+    if pages > 1:
+        e.set_footer(text=f"Page {page + 1}/{pages}")
+    return e, MainView(chunk, page, pages)
 
 
 class MainView(discord.ui.View):
-    def __init__(self, user, guild_id, salons):
+    def __init__(self, chunk, page=0, pages=1):
         super().__init__(timeout=900)
-        self.user, self.guild_id = user, guild_id
-        if salons:
-            self.add_item(SalonSelect(salons))
+        if chunk:
+            self.add_item(SalonSelect(chunk))
         self.add_item(NewButton())
+        if pages > 1:
+            self.add_item(PageButton("◀️", page - 1, disabled=page <= 0))
+            self.add_item(PageButton("▶️", page + 1, disabled=page >= pages - 1))
+
+
+class PageButton(discord.ui.Button):
+    def __init__(self, label, target, disabled=False):
+        super().__init__(label=label, style=discord.ButtonStyle.secondary, row=1, disabled=disabled)
+        self.target = target
+
+    async def callback(self, interaction: discord.Interaction):
+        e, v = main_payload(interaction.user, interaction.guild_id, self.target)
+        await interaction.response.edit_message(embed=e, view=v)
 
 
 class SalonSelect(discord.ui.Select):
@@ -446,10 +538,20 @@ class NewButton(discord.ui.Button):
         super().__init__(label="➕ Nouveau salon", style=discord.ButtonStyle.success, row=1)
 
     async def callback(self, interaction: discord.Interaction):
-        if len(db.by_user(interaction.user.id, interaction.guild_id)) >= MAX_SALONS:
-            return await interaction.response.send_message(
-                f"❌ Tu as atteint la limite de {MAX_SALONS} salons. Supprime-en un d'abord.", ephemeral=True)
+        err = check_can_create(interaction.user, interaction.guild_id)
+        if err:
+            return await interaction.response.send_message(err, ephemeral=True)
         await interaction.response.send_modal(NewSalonModal())
+
+
+def check_can_create(member, guild_id):
+    """Retourne un message d'erreur si le membre ne peut pas créer de salon, sinon None."""
+    tier, limit = access(member)
+    if tier is None:
+        return "❌ Tu n'as pas (ou plus) le rôle nécessaire pour créer des salons."
+    if limit is not None and len(db.by_user(member.id, guild_id)) >= limit:
+        return f"❌ Tu as atteint la limite de {limit} salons. Supprime-en un d'abord."
+    return None
 
 
 async def find_category(guild: discord.Guild):
@@ -477,8 +579,12 @@ class NewSalonModal(discord.ui.Modal, title="➕ Nouveau salon"):
         self.add_item(self.kw_in)
 
     async def on_submit(self, interaction: discord.Interaction):
-        await interaction.response.defer()
         guild, member = interaction.guild, interaction.user
+        # On revérifie au moment de la création (rôle retiré / limite atteinte entre-temps)
+        err = check_can_create(member, guild.id)
+        if err:
+            return await interaction.response.send_message(err, ephemeral=True)
+        await interaction.response.defer()
         try:
             cat = await find_category(guild)
             overwrites = {
@@ -713,16 +819,136 @@ class BrandsModal(discord.ui.Modal, title="🏷️ Marques & tailles"):
         await interaction.response.edit_message(embed=salon_embed(s), view=SalonView(s))
 
 
+# ───────────────────────── Panneau public ─────────────────────────
+def panel_embed(guild: discord.Guild):
+    cfg = db.get_cfg(guild.id)
+
+    def role(rid):
+        r = guild.get_role(rid) if rid else None
+        return r.mention if r else "*(non configuré)*"
+
+    e = discord.Embed(title="🛒 Alertes Vinted personnalisées", color=COLOR)
+    e.description = (
+        "Reçois les nouvelles annonces Vinted **en quelques secondes**, dans **ton propre salon privé**.\n\n"
+        "**Comment ça marche ?**\n"
+        "**1️⃣** Clique sur le bouton ci-dessous (ou utilise `/vip` / `/premium`)\n"
+        "**2️⃣** Clique sur **➕ Nouveau salon** et donne un nom + des mots-clés\n"
+        "   *Ex : « Nike Tech » → `nike tech`*\n"
+        "**3️⃣** Affine avec le prix, la marque, la taille, l'état, le pays\n"
+        "**4️⃣** C'est tout ! Les annonces arrivent avec photos, infos et bouton **Acheter**\n\n"
+        "**Accès :**\n"
+        f"⭐ {role(cfg['vip_role_id'])} → jusqu'à **{cfg['vip_limit']}** salons (`/vip`)\n"
+        f"💎 {role(cfg['premium_role_id'])} → salons **illimités** (`/premium`)\n\n"
+        "*Seul toi (et les admins) pouvez voir tes salons.*"
+    )
+    return e
+
+
 class PanelView(discord.ui.View):
-    """Le panneau permanent posté par /setup."""
+    """Le panneau permanent posté depuis /setup."""
+
     def __init__(self):
         super().__init__(timeout=None)
 
     @discord.ui.button(label="📂 Gérer mes salons Vinted", style=discord.ButtonStyle.primary,
                        custom_id="vinted:open")
     async def open(self, interaction: discord.Interaction, _):
+        tier, _limit = access(interaction.user)
+        if tier is None:
+            cfg = db.get_cfg(interaction.guild_id)
+            roles = [f"<@&{cfg[k]}>" for k in ("vip_role_id", "premium_role_id") if cfg[k]]
+            txt = "❌ Cette fonction est réservée aux membres " + (" / ".join(roles) if roles else "VIP / Premium+") + "."
+            return await interaction.response.send_message(txt, ephemeral=True)
         e, v = main_payload(interaction.user, interaction.guild_id)
         await interaction.response.send_message(embed=e, view=v, ephemeral=True)
+
+
+# ───────────────────────── /setup : configuration (owner) ─────────────────────────
+def setup_payload(guild: discord.Guild):
+    cfg = db.get_cfg(guild.id)
+
+    def role(rid, empty):
+        r = guild.get_role(rid) if rid else None
+        return r.mention if r else empty
+
+    e = discord.Embed(title="⚙️ Configuration du bot Vinted", color=COLOR)
+    e.description = (
+        "Choisis les rôles ci-dessous. Les changements sont **immédiats**.\n\n"
+        f"👑 **Owner** : {role(cfg['owner_role_id'], '*admins du serveur uniquement*')}\n"
+        "   → salons **illimités**, accès au `/setup`\n\n"
+        f"⭐ **VIP** : {role(cfg['vip_role_id'], '*non configuré*')}\n"
+        f"   → commande `/vip` • limite de **{cfg['vip_limit']}** salons\n\n"
+        f"💎 **Premium+** : {role(cfg['premium_role_id'], '*non configuré*')}\n"
+        "   → commande `/premium` • salons **illimités**\n\n"
+        "*Les administrateurs du serveur sont toujours considérés comme Owner.*"
+    )
+    return e, SetupView(guild)
+
+
+class RoleCfgSelect(discord.ui.RoleSelect):
+    def __init__(self, field, placeholder, current_role, row):
+        kw = {"default_values": [current_role]} if current_role else {}
+        super().__init__(placeholder=placeholder, min_values=0, max_values=1, row=row, **kw)
+        self.field = field
+
+    async def callback(self, interaction: discord.Interaction):
+        role = self.values[0] if self.values else None
+        db.set_cfg(interaction.guild_id, **{self.field: role.id if role else None})
+        e, v = setup_payload(interaction.guild)
+        await interaction.response.edit_message(embed=e, view=v)
+
+
+class LimitModal(discord.ui.Modal, title="🔢 Limite de salons VIP"):
+    def __init__(self, cfg):
+        super().__init__()
+        self.inp = discord.ui.TextInput(label="Nombre max de salons par VIP (1 à 200)", max_length=3,
+                                        default=str(cfg["vip_limit"]), placeholder="Ex : 5")
+        self.add_item(self.inp)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not is_owner(interaction.user):
+            return await interaction.response.send_message("❌ Réservé à l'owner.", ephemeral=True)
+        try:
+            n = int(self.inp.value.strip())
+        except ValueError:
+            n = None
+        if n is None or not 1 <= n <= 200:
+            return await interaction.response.send_message("❌ Entre un nombre entre 1 et 200.", ephemeral=True)
+        db.set_cfg(interaction.guild_id, vip_limit=n)
+        e, v = setup_payload(interaction.guild)
+        await interaction.response.edit_message(embed=e, view=v)
+
+
+class SetupView(discord.ui.View):
+    def __init__(self, guild: discord.Guild):
+        super().__init__(timeout=600)
+        cfg = db.get_cfg(guild.id)
+        self.add_item(RoleCfgSelect("owner_role_id", "👑 Rôle Owner (illimité)",
+                                    guild.get_role(cfg["owner_role_id"]) if cfg["owner_role_id"] else None, 0))
+        self.add_item(RoleCfgSelect("vip_role_id", "⭐ Rôle VIP (avec limite)",
+                                    guild.get_role(cfg["vip_role_id"]) if cfg["vip_role_id"] else None, 1))
+        self.add_item(RoleCfgSelect("premium_role_id", "💎 Rôle Premium+ (sans limite)",
+                                    guild.get_role(cfg["premium_role_id"]) if cfg["premium_role_id"] else None, 2))
+        self.limit.label = f"🔢 Limite VIP : {cfg['vip_limit']}"
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not is_owner(interaction.user):
+            await interaction.response.send_message("❌ Réservé à l'owner.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="🔢 Limite VIP", style=discord.ButtonStyle.primary, row=3)
+    async def limit(self, interaction: discord.Interaction, _):
+        await interaction.response.send_modal(LimitModal(db.get_cfg(interaction.guild_id)))
+
+    @discord.ui.button(label="📌 Poster le panneau ici", style=discord.ButtonStyle.success, row=3)
+    async def post_panel(self, interaction: discord.Interaction, _):
+        try:
+            await interaction.channel.send(embed=panel_embed(interaction.guild), view=PanelView())
+        except (discord.Forbidden, discord.HTTPException):
+            return await interaction.response.send_message(
+                "❌ Je ne peux pas écrire dans ce salon (permission manquante).", ephemeral=True)
+        await interaction.response.send_message("✅ Panneau posté !", ephemeral=True)
 
 
 # ───────────────────────── Bot ─────────────────────────
@@ -794,7 +1020,7 @@ class VintedBot(discord.Client):
                 continue
             ids = {i["id"] for i in items}
             seen = self.seen.get(key)
-            if seen is None:           # première fois : on mémorise sans notifier
+            if seen is None:  # première fois : on mémorise sans notifier
                 self.seen[key] = ids
                 continue
             new = sorted((i for i in items if i["id"] not in seen), key=lambda i: i["id"])
@@ -820,7 +1046,7 @@ class VintedBot(discord.Client):
             except discord.NotFound:
                 raise
             except Exception:
-                await wh.send(embeds=embeds, username="Vinted Bot")   # sans boutons si non supporté
+                await wh.send(embeds=embeds, username="Vinted Bot")  # sans boutons si non supporté
             self.total_sent = getattr(self, "total_sent", 0) + 1
             log.info("→ %s : %s (%s)", s["name"], it["title"], it["url"])
         except discord.NotFound:
@@ -833,26 +1059,43 @@ class VintedBot(discord.Client):
 bot = VintedBot()
 
 
-@bot.tree.command(name="setup", description="Poste le panneau Vinted dans ce salon (admin)")
+# ───────────────────────── Commandes ─────────────────────────
+@bot.tree.command(name="setup", description="Configuration du bot : rôles VIP / Premium+, limite (owner)")
 @app_commands.default_permissions(administrator=True)
 @app_commands.guild_only()
 async def setup(interaction: discord.Interaction):
-    e = discord.Embed(title="🛒 Alertes Vinted personnalisées", color=COLOR)
-    e.description = (
-        "Reçois les nouvelles annonces Vinted **en quelques secondes**, dans **ton propre salon privé**.\n\n"
-        "**Comment ça marche ?**\n"
-        "**1️⃣** Clique sur le bouton ci-dessous\n"
-        "**2️⃣** Clique sur **➕ Nouveau salon** et donne un nom + des mots-clés\n"
-        "　　*Ex : « Nike Tech » → `nike tech`*\n"
-        "**3️⃣** Affine avec le prix, la marque, la taille, l'état, le pays\n"
-        "**4️⃣** C'est tout ! Les annonces arrivent avec photos, infos et bouton **Acheter**\n\n"
-        "**Tu veux plusieurs recherches séparées ?**\n"
-        "Crée plusieurs salons : un **Nike Tech**, un **Running**, un **Trail**… "
-        "Chacun a ses propres réglages et rien n'est mélangé.\n\n"
-        "*Seul toi (et les admins) pouvez voir tes salons.*"
-    )
-    await interaction.channel.send(embed=e, view=PanelView())
-    await interaction.response.send_message("✅ Panneau posté !", ephemeral=True)
+    if not is_owner(interaction.user):
+        return await interaction.response.send_message("❌ Commande réservée à l'owner.", ephemeral=True)
+    e, v = setup_payload(interaction.guild)
+    await interaction.response.send_message(embed=e, view=v, ephemeral=True)
+
+
+@bot.tree.command(name="vip", description="Gère tes salons Vinted (rôle VIP, nombre de salons limité)")
+@app_commands.guild_only()
+async def vip_cmd(interaction: discord.Interaction):
+    cfg = db.get_cfg(interaction.guild_id)
+    if not cfg["vip_role_id"]:
+        return await interaction.response.send_message(
+            "⚠️ Le rôle VIP n'est pas encore configuré. Un owner doit faire `/setup`.", ephemeral=True)
+    if not (is_owner(interaction.user) or has_role(interaction.user, cfg["vip_role_id"])):
+        return await interaction.response.send_message(
+            f"❌ Cette commande est réservée au rôle <@&{cfg['vip_role_id']}>.", ephemeral=True)
+    e, v = main_payload(interaction.user, interaction.guild_id)
+    await interaction.response.send_message(embed=e, view=v, ephemeral=True)
+
+
+@bot.tree.command(name="premium", description="Gère tes salons Vinted (rôle Premium+, salons illimités)")
+@app_commands.guild_only()
+async def premium_cmd(interaction: discord.Interaction):
+    cfg = db.get_cfg(interaction.guild_id)
+    if not cfg["premium_role_id"]:
+        return await interaction.response.send_message(
+            "⚠️ Le rôle Premium+ n'est pas encore configuré. Un owner doit faire `/setup`.", ephemeral=True)
+    if not (is_owner(interaction.user) or has_role(interaction.user, cfg["premium_role_id"])):
+        return await interaction.response.send_message(
+            f"❌ Cette commande est réservée au rôle <@&{cfg['premium_role_id']}>.", ephemeral=True)
+    e, v = main_payload(interaction.user, interaction.guild_id)
+    await interaction.response.send_message(embed=e, view=v, ephemeral=True)
 
 
 if __name__ == "__main__":

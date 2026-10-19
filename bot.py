@@ -35,6 +35,9 @@ DEFAULT_VIP_LIMIT = int(os.getenv("MAX_SALONS_PER_USER", "5"))
 CATEGORY_NAME = os.getenv("CATEGORY_NAME", "🛒 Vinted")
 DB_PATH = os.getenv("DB_PATH", "vinted_bot.db")
 FETCH_DETAILS = os.getenv("FETCH_DETAILS", "0") == "1"
+# 0 (défaut) = on fait confiance à la recherche Vinted (mêmes résultats que sur le site).
+# 1 = on exige en plus que tous les mots du mot-clé soient dans le titre/la marque.
+STRICT_KEYWORDS = os.getenv("STRICT_KEYWORDS", "0") == "1"
 PAGE_SIZE = 25  # un menu déroulant Discord = 25 choix max -> on pagine
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -58,9 +61,10 @@ def norm(text: str) -> str:
     return "".join(c for c in text if unicodedata.category(c) != "Mn").strip()
 
 
-def parse_list(text: str) -> list:
+def parse_list(text: str, commas: bool = True) -> list:
+    """commas=False : un élément par ligne uniquement (mots-clés, exclusions)."""
     out = []
-    for part in re.split(r"[,\n;]+", text or ""):
+    for part in re.split(r"[,\n;]+" if commas else r"[\r\n]+", text or ""):
         part = norm(part)
         if part and part not in out:
             out.append(part)
@@ -88,6 +92,19 @@ def fmt_age(sec) -> str:
 
 def fmt_list(values) -> str:
     return ", ".join(values) if values else "— (tout accepter)"
+
+
+def fmt_lines(values, empty="—") -> str:
+    return "\n".join(f"• {v}" for v in values) if values else empty
+
+
+def is_excluded(title: str, brand: str, excluded) -> bool:
+    """Exclusion par mot entier (accepte le pluriel) : « lot » n'exclut plus « pilote »."""
+    hay = f"{title} {brand}"
+    for x in excluded:
+        if re.search(r"(?<!\w)" + re.escape(x) + r"(?:s|x)?(?!\w)", hay):
+            return True
+    return False
 
 
 def slugify(text: str) -> str:
@@ -406,10 +423,11 @@ class VintedClient:
 # ───────────────────────── Filtres ─────────────────────────
 def matches(s: dict, kw: str, it: dict) -> bool:
     title = norm(it["title"])
-    hay = f"{title} {norm(it['brand'])}"
-    if not all(w in hay for w in norm(kw).split()):
+    brand = norm(it["brand"])
+    hay = f"{title} {brand}"
+    if STRICT_KEYWORDS and not all(w in hay for w in norm(kw).split()):
         return False
-    if any(x in title for x in s["excluded"]):
+    if is_excluded(title, brand, s["excluded"]):
         return False
     if it["price"] is not None:
         if s["price_min"] is not None and it["price"] < s["price_min"]:
@@ -573,8 +591,9 @@ class NewSalonModal(discord.ui.Modal, title="➕ Nouveau salon"):
         super().__init__()
         self.name_in = discord.ui.TextInput(label="Nom du salon", max_length=50,
                                             placeholder="Ex : Nike Tech")
-        self.kw_in = discord.ui.TextInput(label="Mots-clés (sépare par des virgules)", max_length=300,
-                                          placeholder="Ex : nike tech, nike tech fleece")
+        self.kw_in = discord.ui.TextInput(label="Mots-clés (un par ligne)", max_length=300,
+                                          style=discord.TextStyle.paragraph,
+                                          placeholder="Ex :\nnike tech\nnike trail")
         self.add_item(self.name_in)
         self.add_item(self.kw_in)
 
@@ -602,7 +621,8 @@ class NewSalonModal(discord.ui.Modal, title="➕ Nouveau salon"):
             return await interaction.followup.send(
                 "❌ Il me manque des permissions : **Gérer les salons** et **Gérer les webhooks**.", ephemeral=True)
         sid = db.add(user_id=member.id, guild_id=guild.id, name=self.name_in.value.strip(),
-                     channel_id=channel.id, webhook_url=wh.url, keywords=parse_list(self.kw_in.value))
+                     channel_id=channel.id, webhook_url=wh.url,
+                     keywords=parse_list(self.kw_in.value, commas=False))
         await channel.send(f"📦 {member.mention} ton salon **{self.name_in.value}** est prêt ! "
                            f"Les annonces correspondantes arriveront ici.")
         s = db.get(sid)
@@ -618,16 +638,16 @@ def salon_embed(s: dict, created=False):
                        "Les changements sont pris en compte **immédiatement**.")
     pmin = f"{s['price_min']:g} €" if s["price_min"] is not None else "—"
     pmax = f"{s['price_max']:g} €" if s["price_max"] is not None else "—"
-    e.add_field(name="🔎 Mots-clés", value=fmt_list(s["keywords"]), inline=False)
-    e.add_field(name="🚫 Mots exclus", value=", ".join(s["excluded"]) or "—", inline=False)
+    e.add_field(name="🔎 Mots-clés", value=fmt_lines(s["keywords"], "— (aucun)")[:1000], inline=False)
+    e.add_field(name="🚫 Exclusions (types d'articles)", value=fmt_lines(s["excluded"])[:1000], inline=False)
     e.add_field(name="💶 Prix", value=f"min {pmin} • max {pmax}", inline=False)
     e.add_field(name="🏷️ Marques", value=fmt_list(s["brands"]), inline=True)
     e.add_field(name="📏 Tailles", value=fmt_list(s["sizes"]), inline=True)
     e.add_field(name="✨ États", value=fmt_list(s["conditions"]), inline=True)
     e.add_field(name="🌍 Pays", value=COUNTRIES.get(s["country"], s["country"]), inline=True)
     e.add_field(name="⏱️ Âge max", value=fmt_age(s.get("max_age")), inline=True)
-    e.set_footer(text="💡 Astuce : plusieurs mots-clés = plusieurs recherches. "
-                      "« nike tech, nike trail » te montre les deux.")
+    e.set_footer(text="💡 Astuce : un mot-clé par ligne = une recherche chacun. "
+                      "Ex : « nike tech » puis « nike trail » à la ligne.")
     return e
 
 
@@ -662,6 +682,10 @@ class SalonView(discord.ui.View):
     @discord.ui.button(label="🏷️ Marques & tailles", style=discord.ButtonStyle.primary, row=0)
     async def brands(self, interaction: discord.Interaction, _):
         await interaction.response.send_modal(BrandsModal(db.get(self.sid)))
+
+    @discord.ui.button(label="🚫 Exclure", style=discord.ButtonStyle.primary, row=0)
+    async def exclude(self, interaction: discord.Interaction, _):
+        await interaction.response.send_modal(ExcludeModal(db.get(self.sid)))
 
     @discord.ui.button(label="⏸️", row=4)
     async def toggle(self, interaction: discord.Interaction, _):
@@ -754,18 +778,14 @@ class KeywordsModal(discord.ui.Modal, title="✏️ Nom & mots-clés"):
         self.channel_id = s["channel_id"]
         self.name_in = discord.ui.TextInput(label="Nom du salon", max_length=50, default=s["name"])
         self.kw_in = discord.ui.TextInput(
-            label="Mots-clés (séparés par des virgules)", style=discord.TextStyle.paragraph, max_length=500,
-            default=", ".join(s["keywords"]), placeholder="nike tech, nike trail, nike running")
-        self.ex_in = discord.ui.TextInput(
-            label="Mots à exclure (optionnel)", style=discord.TextStyle.paragraph, required=False,
-            max_length=500, default=", ".join(s["excluded"]), placeholder="enfant, faux, lot, fake")
-        for i in (self.name_in, self.kw_in, self.ex_in):
+            label="Mots-clés (un par ligne)", style=discord.TextStyle.paragraph, max_length=500,
+            default="\n".join(s["keywords"]), placeholder="nike tech\nnike trail\nnike running")
+        for i in (self.name_in, self.kw_in):
             self.add_item(i)
 
     async def on_submit(self, interaction: discord.Interaction):
         name = self.name_in.value.strip()
-        db.update(self.sid, name=name, keywords=parse_list(self.kw_in.value),
-                  excluded=parse_list(self.ex_in.value))
+        db.update(self.sid, name=name, keywords=parse_list(self.kw_in.value, commas=False))
         s = db.get(self.sid)
         await interaction.response.edit_message(embed=salon_embed(s), view=SalonView(s))
         if name != self.old_name:
@@ -779,6 +799,22 @@ class KeywordsModal(discord.ui.Modal, title="✏️ Nom & mots-clés"):
             await ch.edit(name=f"{slugify(name)}-{slugify(member.name)}"[:95])
         except Exception:
             pass
+
+
+class ExcludeModal(discord.ui.Modal, title="🚫 Exclure des articles"):
+    def __init__(self, s):
+        super().__init__()
+        self.sid = s["id"]
+        self.ex_in = discord.ui.TextInput(
+            label="Types d'articles à exclure (un par ligne)", style=discord.TextStyle.paragraph,
+            required=False, max_length=500, default="\n".join(s["excluded"]),
+            placeholder="t-shirt\nenfant\nlot\nfake")
+        self.add_item(self.ex_in)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        db.update(self.sid, excluded=parse_list(self.ex_in.value, commas=False))
+        s = db.get(self.sid)
+        await interaction.response.edit_message(embed=salon_embed(s), view=SalonView(s))
 
 
 class PriceModal(discord.ui.Modal, title="💶 Fourchette de prix"):

@@ -139,6 +139,30 @@ def salon_queries(s: dict) -> list:
     return out[:20]
 
 
+def parse_ts(v):
+    try:
+        v = int(float(v)) if v else None
+        return v // 1000 if v and v > 10**11 else v
+    except (TypeError, ValueError):
+        return None
+
+
+def ts_from_details(extra):
+    """Heure de mise en ligne depuis la fiche détaillée (la recherche ne la fournit plus)."""
+    if not extra:
+        return None
+    for k in ("created_at_ts", "created_at", "updated_at_ts"):
+        ts = parse_ts(extra.get(k))
+        if ts:
+            return ts
+    for ph in extra.get("photos") or []:
+        if isinstance(ph, dict):
+            ts = parse_ts((ph.get("high_resolution") or {}).get("timestamp"))
+            if ts:
+                return ts
+    return None
+
+
 def slugify(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", norm(text)).strip("-")[:60] or "salon"
 
@@ -1135,6 +1159,15 @@ class VintedBot(discord.Client):
         async with self.sem:
             return await self.vinted.search(domain, kw, page)
 
+    async def item_ts(self, it):
+        """Heure de mise en ligne : celle de la recherche, sinon lue dans la fiche de l'annonce."""
+        if it["ts"]:
+            return it["ts"]
+        ts = ts_from_details(await self.get_details(it))
+        if ts:
+            it["ts"] = ts
+        return ts
+
     async def _search_all(self, domain, kw, max_age=0):
         """Toutes les pages de résultats (du plus récent au plus ancien), jusqu'à la fin des résultats
         ou jusqu'à dépasser l'âge max choisi. Retourne None si Vinted ne répond pas du tout."""
@@ -1146,9 +1179,10 @@ class VintedBot(discord.Client):
             out.extend(items)
             if len(items) < 40:
                 break  # dernière page
-            stamps = [i["ts"] for i in items if i["ts"]]
-            if max_age and stamps and now - min(stamps) > max_age:
-                break  # on est déjà remonté plus loin que la durée choisie
+            if max_age:
+                ts = await self.item_ts(min(items, key=lambda i: i["id"]))
+                if ts and now - ts > max_age:
+                    break  # on est déjà remonté plus loin que la durée choisie
         return out
 
     async def poll_once(self):
@@ -1251,6 +1285,25 @@ class VintedBot(discord.Client):
                     if it["id"] not in cands and basic_ok(s, it):
                         cands[it["id"]] = (q, it)
             newest = sorted(cands.values(), key=lambda c: c[1]["id"], reverse=True)
+            if s.get("max_age"):
+                kept, now, unknown = [], time.time(), 0
+                for i in range(0, len(newest), 20):  # du plus récent au plus ancien, par paquets
+                    batch = newest[i:i + 20]
+                    stamps = await asyncio.gather(*(self.item_ts(it) for _, it in batch))
+                    too_old = False
+                    for c, ts in zip(batch, stamps):
+                        if ts is None:
+                            unknown += 1
+                        if ts and now - ts > s["max_age"]:
+                            too_old = True
+                        else:
+                            kept.append(c)
+                    if too_old:
+                        break  # les ids suivants sont encore plus anciens
+                if unknown:
+                    log.warning("Salon %s : heure de mise en ligne introuvable pour %s annonce(s), filtre d'âge impossible pour elles",
+                                s["name"], unknown)
+                newest = kept
             checks = await asyncio.gather(*(self.check(q, it) for q, it in newest))
             keep = [(it, extra) for (q, it), (ok, extra) in zip(newest, checks) if ok]
             if clear:

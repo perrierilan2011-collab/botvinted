@@ -39,6 +39,9 @@ FETCH_DETAILS = os.getenv("FETCH_DETAILS", "0") == "1"
 # 0 = on ne regarde que le titre et la marque (plus rapide, moins d'appels à Vinted).
 CHECK_DESCRIPTION = os.getenv("CHECK_DESCRIPTION", "1") == "1"
 PAGE_SIZE = 25  # un menu déroulant Discord = 25 choix max -> on pagine
+# Bouton « Rafraîchir » : aucune limite d'annonces. Garde-fou technique uniquement : nombre max de pages
+# Vinted lues par recherche (40 annonces par page) pour ne pas se faire bloquer.
+BACKFILL_MAX_PAGES = int(os.getenv("BACKFILL_MAX_PAGES", "50"))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("vinted")
@@ -388,11 +391,11 @@ class VintedClient:
             self._lastlog[key] = now
             log.warning(msg, *args)
 
-    async def search(self, domain, text):
+    async def search(self, domain, text, page=1):
         if time.time() < self.cooldown.get(domain, 0):
             return None
         sess = await self._session(domain)
-        params = {"search_text": text, "order": "newest_first", "per_page": "40", "page": "1"}
+        params = {"search_text": text, "order": "newest_first", "per_page": "40", "page": str(page)}
         order = [self.ep[domain]] if domain in self.ep else range(len(ENDPOINTS))
         refreshed = False
         for idx in order:
@@ -645,7 +648,8 @@ class NewSalonModal(discord.ui.Modal, title="➕ Nouveau salon"):
                 member: discord.PermissionOverwrite(view_channel=True, read_message_history=True,
                                                     send_messages=False),
                 guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, embed_links=True,
-                                                      manage_webhooks=True, manage_channels=True),
+                                                      manage_webhooks=True, manage_channels=True,
+                                                      manage_messages=True, read_message_history=True),
             }
             channel = await guild.create_text_channel(
                 f"{slugify(self.name_in.value)}-{slugify(member.name)}"[:95], category=cat,
@@ -670,7 +674,8 @@ def salon_embed(s: dict, created=False):
     e.description = (("✅ **Salon créé !** " if created else "")
                      + f"{state} • Annonces dans <#{s['channel_id']}>\n"
                        "Utilise les boutons ci-dessous pour régler tes filtres. "
-                       "Les changements sont pris en compte **immédiatement**.")
+                       "Les changements sont pris en compte **immédiatement** pour les nouvelles annonces. "
+                       "Clique sur **🔄 Rafraîchir** pour revoir les annonces avec tes nouveaux filtres.")
     pmin = f"{s['price_min']:g} €" if s["price_min"] is not None else "—"
     pmax = f"{s['price_max']:g} €" if s["price_max"] is not None else "—"
     e.add_field(name="👕 Types d'articles", value=fmt_lines(s["item_types"], "— (tous les types)")[:1000],
@@ -745,6 +750,44 @@ class SalonView(discord.ui.View):
     async def back(self, interaction: discord.Interaction, _):
         e, v = main_payload(interaction.user, interaction.guild_id)
         await interaction.response.edit_message(embed=e, view=v)
+
+    @discord.ui.button(label="🧹 Vider", style=discord.ButtonStyle.secondary, row=4)
+    async def clear_btn(self, interaction: discord.Interaction, _):
+        """Supprime tous les messages du salon Discord."""
+        s = db.get(self.sid)
+        ch = interaction.guild.get_channel(s["channel_id"]) if s else None
+        if ch is None:
+            return await interaction.response.send_message("❌ Salon Discord introuvable.", ephemeral=True)
+        await interaction.response.defer(ephemeral=True)
+        try:
+            n = await bot.clear_channel(ch)
+        except discord.Forbidden:
+            return await interaction.followup.send(
+                "❌ Il me manque la permission **Gérer les messages** (et **Voir les anciens messages**) "
+                "dans ce salon.", ephemeral=True)
+        await interaction.followup.send(f"🧹 Salon vidé : **{n}** message(s) supprimé(s).", ephemeral=True)
+
+    @discord.ui.button(label="🔄 Rafraîchir", style=discord.ButtonStyle.success, row=4)
+    async def refresh_btn(self, interaction: discord.Interaction, _):
+        """Vide le salon puis relance la recherche comme si les mots étaient tapés dans Vinted."""
+        if self.sid in bot.backfilling:
+            return await interaction.response.send_message("⏳ Un rafraîchissement est déjà en cours.",
+                                                           ephemeral=True)
+        await interaction.response.defer(ephemeral=True)
+        try:
+            n = await bot.backfill(self.sid)
+        except discord.Forbidden:
+            return await interaction.followup.send(
+                "❌ Il me manque la permission **Gérer les messages** (et **Voir les anciens messages**) "
+                "dans ce salon.", ephemeral=True)
+        if n is None:
+            return await interaction.followup.send(
+                "⚠️ Vinted n'a pas répondu (ou aucun mot-clé/type/marque défini). Rien n'a été supprimé, réessaie.",
+                ephemeral=True)
+        await interaction.followup.send(
+            f"🔄 Salon rafraîchi : **{n}** annonce(s) correspondante(s) envoyée(s)."
+            if n else "🔄 Salon vidé, mais aucune annonce ne correspond à tes filtres en ce moment.",
+            ephemeral=True)
 
 
 class ConfirmDelete(discord.ui.View):
@@ -1055,6 +1098,7 @@ class VintedBot(discord.Client):
         self.web_session: aiohttp.ClientSession | None = None
         self.sem = asyncio.Semaphore(12)
         self.dcache: dict = {}
+        self.backfilling: set = set()
 
     async def setup_hook(self):
         self.web_session = aiohttp.ClientSession()
@@ -1087,9 +1131,25 @@ class VintedBot(discord.Client):
                 log.exception("Erreur dans la boucle")
             await asyncio.sleep(max(0.2, POLL_INTERVAL - (time.monotonic() - t0)))
 
-    async def _search(self, domain, kw):
+    async def _search(self, domain, kw, page=1):
         async with self.sem:
-            return await self.vinted.search(domain, kw)
+            return await self.vinted.search(domain, kw, page)
+
+    async def _search_all(self, domain, kw, max_age=0):
+        """Toutes les pages de résultats (du plus récent au plus ancien), jusqu'à la fin des résultats
+        ou jusqu'à dépasser l'âge max choisi. Retourne None si Vinted ne répond pas du tout."""
+        out, now = [], time.time()
+        for page in range(1, BACKFILL_MAX_PAGES + 1):
+            items = await self._search(domain, kw, page)
+            if items is None:
+                return out or None
+            out.extend(items)
+            if len(items) < 40:
+                break  # dernière page
+            stamps = [i["ts"] for i in items if i["ts"]]
+            if max_age and stamps and now - min(stamps) > max_age:
+                break  # on est déjà remonté plus loin que la durée choisie
+        return out
 
     async def poll_once(self):
         groups: dict = {}
@@ -1143,21 +1203,68 @@ class VintedBot(discord.Client):
                 cache.pop(next(iter(cache)))
         return extra
 
-    async def process(self, s, query, it):
-        """Tous les mots de la recherche doivent être dans le titre/la marque OU dans la description."""
+    async def check(self, query, it):
+        """Tous les mots de la recherche doivent être dans le titre/la marque OU dans la description.
+        Retourne (ok, détails)."""
         hay = f"{norm(it['title'])} {norm(it['brand'])}"
         extra = None
         if not words_in(hay, query):
             if not CHECK_DESCRIPTION:
-                return
+                return False, None
             extra = await self.get_details(it)
             if not extra:
-                return  # description introuvable : on ne peut pas confirmer, on n'envoie pas
+                return False, None  # description introuvable : on ne peut pas confirmer, on n'envoie pas
             if not words_in(f"{hay} {norm(extra.get('description'))}", query):
-                return
+                return False, None
         elif FETCH_DETAILS:
             extra = await self.get_details(it)
-        await self.deliver(s, it, extra)
+        return True, extra
+
+    async def process(self, s, query, it):
+        ok, extra = await self.check(query, it)
+        if ok:
+            await self.deliver(s, it, extra)
+
+    async def clear_channel(self, channel) -> int:
+        """Supprime tous les messages du salon (sauf les messages épinglés)."""
+        deleted = await channel.purge(limit=None, check=lambda m: not m.pinned)
+        return len(deleted)
+
+    async def backfill(self, sid, clear=True):
+        """Comme si on tapait les mots dans la barre de recherche Vinted : lance la recherche avec les
+        réglages actuels du salon (dont l'âge max) et envoie toutes les annonces qui correspondent.
+        Retourne le nombre d'annonces envoyées, ou None si Vinted n'a pas répondu (rien n'est supprimé)."""
+        s = db.get(sid)
+        if not s:
+            return 0
+        self.backfilling.add(sid)
+        try:
+            queries = salon_queries(s)
+            if not queries:
+                return None
+            results = await asyncio.gather(*(self._search_all(s["country"], q, s.get("max_age") or 0) for q in queries))
+            if all(r is None for r in results):
+                return None
+            cands = {}
+            for q, items in zip(queries, results):
+                for it in items or []:
+                    if it["id"] not in cands and basic_ok(s, it):
+                        cands[it["id"]] = (q, it)
+            newest = sorted(cands.values(), key=lambda c: c[1]["id"], reverse=True)
+            checks = await asyncio.gather(*(self.check(q, it) for q, it in newest))
+            keep = [(it, extra) for (q, it), (ok, extra) in zip(newest, checks) if ok]
+            if clear:
+                ch = self.get_channel(s["channel_id"])
+                if ch:
+                    await self.clear_channel(ch)
+            for k in [k for k in self.sent if k[0] == sid]:
+                del self.sent[k]
+            for it, extra in reversed(keep):  # le plus ancien d'abord -> le plus récent en bas du salon
+                self.sent[(sid, it["id"])] = None
+                await self.deliver(s, it, extra)
+            return len(keep)
+        finally:
+            self.backfilling.discard(sid)
 
     async def deliver(self, s, it, extra=None):
         embeds, view = build_message(s, it, extra)

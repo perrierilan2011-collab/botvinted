@@ -27,7 +27,7 @@ PROXY = os.getenv("PROXY") or None
 MAX_SALONS = min(int(os.getenv("MAX_SALONS_PER_USER", "5")), 25)
 CATEGORY_NAME = os.getenv("CATEGORY_NAME", "🛒 Vinted")
 DB_PATH = os.getenv("DB_PATH", "vinted_bot.db")
-FETCH_DETAILS = os.getenv("FETCH_DETAILS", "1") == "1"
+FETCH_DETAILS = os.getenv("FETCH_DETAILS", "0") == "1"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("vinted")
@@ -139,6 +139,20 @@ db = DB(DB_PATH)
 
 
 # ───────────────────────── Client Vinted ─────────────────────────
+def extract_items(data):
+    """Trouve la liste d'annonces dans la réponse, quel que soit le format."""
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        for k in ("items", "catalog_items"):
+            if isinstance(data.get(k), list):
+                return data[k]
+        inner = data.get("data")
+        if isinstance(inner, dict):
+            return extract_items(inner)
+    return None
+
+
 def norm_item(it: dict, domain: str) -> dict:
     price = it.get("price")
     if isinstance(price, dict):
@@ -149,23 +163,39 @@ def norm_item(it: dict, domain: str) -> dict:
         amount = float(amount)
     except (TypeError, ValueError):
         amount = None
-    photo = it.get("photo") or {}
+    photo = it.get("photo")
+    purl, ts = None, None
+    if isinstance(photo, dict):
+        purl = photo.get("full_size_url") or photo.get("url")
+        ts = (photo.get("high_resolution") or {}).get("timestamp")
+    elif isinstance(photo, str):
+        purl = photo
+    if not purl and it.get("photos"):
+        first = it["photos"][0]
+        purl = (first.get("full_size_url") or first.get("url")) if isinstance(first, dict) else first
     user = it.get("user") or {}
-    url = it.get("url") or f"https://www.vinted.{domain}/items/{it['id']}"
+    url = it.get("url") or it.get("path") or f"/items/{it['id']}"
     if url.startswith("/"):
         url = f"https://www.vinted.{domain}{url}"
     return {
         "id": int(it["id"]), "title": it.get("title") or "", "price": amount, "currency": cur,
         "brand": it.get("brand_title") or "", "size": it.get("size_title") or "",
-        "status": it.get("status") or "", "url": url,
-        "photo": photo.get("full_size_url") or photo.get("url"),
-        "ts": (photo.get("high_resolution") or {}).get("timestamp"),
+        "status": it.get("status") or "", "url": url, "photo": purl, "ts": ts,
         "seller": user.get("login"), "seller_url": user.get("profile_url"), "domain": domain,
     }
 
 
+ENDPOINTS = [
+    "https://www.vinted.{d}/svc-catalogue/items",
+    "https://api.www.vinted.{d}/svc-catalogue/items",
+    "https://www.vinted.{d}/api/v2/catalog/items",
+]
+
+
 class VintedClient:
     def __init__(self):
+        self.ep: dict = {}
+        self._lastlog: dict = {}
         self.sessions: dict = {}
         self.locks: dict = {}
         self.cooldown: dict = {}
@@ -194,31 +224,56 @@ class VintedClient:
             except Exception as e:
                 log.warning("Refresh cookies %s échoué: %s", domain, e)
 
+    def _warn(self, key, msg, *args):
+        """Évite de spammer les logs : 1 message identique toutes les 30 s."""
+        now = time.time()
+        if now - self._lastlog.get(key, 0) > 30:
+            self._lastlog[key] = now
+            log.warning(msg, *args)
+
     async def search(self, domain, text):
         if time.time() < self.cooldown.get(domain, 0):
             return None
         sess = await self._session(domain)
-        url = f"https://www.vinted.{domain}/api/v2/catalog/items"
         params = {"search_text": text, "order": "newest_first", "per_page": "40", "page": "1"}
-        for _ in range(2):
-            try:
-                async with sess.get(url, params=params, headers=self._headers(domain), proxy=PROXY,
-                                    timeout=aiohttp.ClientTimeout(total=8)) as r:
-                    if r.status in (401, 403):
-                        await self.refresh(domain)
-                        continue
-                    if r.status == 429:
-                        self.cooldown[domain] = time.time() + 30
-                        log.warning("Rate limit sur vinted.%s, pause 30s (utilise un proxy ou augmente POLL_INTERVAL)", domain)
-                        return None
-                    if r.status != 200:
-                        log.warning("Vinted.%s a répondu HTTP %s pour « %s »", domain, r.status, text)
-                        return None
-                    data = await r.json(content_type=None)
-                    return [norm_item(i, domain) for i in data.get("items", [])]
-            except Exception as e:
-                log.warning("Erreur requête Vinted « %s » : %s", text, e)
-        log.warning("Vinted.%s bloque les requêtes (403 après refresh) pour « %s » : IP probablement bloquée, utilise un proxy", domain, text)
+        order = [self.ep[domain]] if domain in self.ep else range(len(ENDPOINTS))
+        refreshed = False
+        for idx in order:
+            url = ENDPOINTS[idx].format(d=domain)
+            for _ in range(2):
+                try:
+                    async with sess.get(url, params=params, headers=self._headers(domain), proxy=PROXY,
+                                        timeout=aiohttp.ClientTimeout(total=8)) as r:
+                        if r.status in (401, 403) and not refreshed:
+                            refreshed = True
+                            await self.refresh(domain)
+                            continue
+                        if r.status == 404:
+                            self.ep.pop(domain, None)
+                            self._warn((domain, idx, 404), "404 sur %s (on essaie une autre adresse)", url)
+                            break
+                        if r.status == 429:
+                            self.cooldown[domain] = time.time() + 30
+                            log.warning("Rate limit sur vinted.%s, pause 30s (monte POLL_INTERVAL ou utilise un proxy)", domain)
+                            return None
+                        if r.status != 200:
+                            self._warn((domain, r.status), "Vinted.%s a répondu HTTP %s (%s)%s", domain, r.status, url,
+                                       " : IP probablement bloquée, utilise un proxy" if r.status in (401, 403) else "")
+                            return None
+                        data = await r.json(content_type=None)
+                        raw = extract_items(data)
+                        if raw is None:
+                            self._warn((domain, "fmt"), "Réponse inattendue de %s, clés : %s", url,
+                                       list(data.keys()) if isinstance(data, dict) else type(data))
+                            return None
+                        if domain not in self.ep:
+                            self.ep[domain] = idx
+                            sample = raw[0] if raw and isinstance(raw[0], dict) else {}
+                            log.info("✅ API Vinted.%s OK via %s | clés d'une annonce : %s", domain, url, sorted(sample.keys()))
+                        return [norm_item(i, domain) for i in raw if isinstance(i, dict) and i.get("id")]
+                except Exception as e:
+                    self._warn((domain, "exc"), "Erreur requête Vinted « %s » : %s", text, e)
+                    break
         return None
 
     async def details(self, domain, item_id):

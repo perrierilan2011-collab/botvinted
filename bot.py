@@ -35,9 +35,9 @@ DEFAULT_VIP_LIMIT = int(os.getenv("MAX_SALONS_PER_USER", "5"))
 CATEGORY_NAME = os.getenv("CATEGORY_NAME", "🛒 Vinted")
 DB_PATH = os.getenv("DB_PATH", "vinted_bot.db")
 FETCH_DETAILS = os.getenv("FETCH_DETAILS", "0") == "1"
-# 0 (défaut) = on fait confiance à la recherche Vinted (mêmes résultats que sur le site).
-# 1 = on exige en plus que tous les mots du mot-clé soient dans le titre/la marque.
-STRICT_KEYWORDS = os.getenv("STRICT_KEYWORDS", "0") == "1"
+# 1 (défaut) = si un mot de la recherche n'est pas dans le titre, on lit la description de l'annonce.
+# 0 = on ne regarde que le titre et la marque (plus rapide, moins d'appels à Vinted).
+CHECK_DESCRIPTION = os.getenv("CHECK_DESCRIPTION", "1") == "1"
 PAGE_SIZE = 25  # un menu déroulant Discord = 25 choix max -> on pagine
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -107,12 +107,41 @@ def is_excluded(title: str, brand: str, excluded) -> bool:
     return False
 
 
+def words_in(text: str, query: str) -> bool:
+    """Vrai si TOUS les mots de la requête sont dans le texte (début de mot : « doudoune » trouve « doudounes »)."""
+    return all(re.search(r"(?<!\w)" + re.escape(w), text) for w in query.split())
+
+
+def build_query(*parts) -> str:
+    words = []
+    for p in parts:
+        for w in norm(p).split():
+            if w not in words:
+                words.append(w)
+    return " ".join(words)
+
+
+def salon_queries(s: dict) -> list:
+    """Une recherche Vinted par combinaison marque × type × modèle (ex : « nike doudoune tech fleece »)."""
+    brands = s["brands"] or [""]
+    types = s["item_types"] or [""]
+    kws = s["keywords"] or [""]
+    out = []
+    for b in brands:
+        for t in types:
+            for k in kws:
+                q = build_query(b, t, k)
+                if q and q not in out:
+                    out.append(q)
+    return out[:20]
+
+
 def slugify(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", norm(text)).strip("-")[:60] or "salon"
 
 
 # ───────────────────────── Base de données ─────────────────────────
-LIST_FIELDS = ("keywords", "excluded", "brands", "sizes", "conditions")
+LIST_FIELDS = ("keywords", "excluded", "brands", "sizes", "conditions", "item_types")
 CFG_FIELDS = ("owner_role_id", "vip_role_id", "premium_role_id", "vip_limit")
 
 
@@ -131,6 +160,10 @@ class DB:
             country TEXT DEFAULT 'fr', active INTEGER DEFAULT 1)""")
         try:
             self.c.execute("ALTER TABLE salons ADD COLUMN max_age INTEGER DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass  # colonne déjà présente
+        try:
+            self.c.execute("ALTER TABLE salons ADD COLUMN item_types TEXT DEFAULT '[]'")
         except sqlite3.OperationalError:
             pass  # colonne déjà présente
         # Configuration par serveur (rôles + limite VIP), réglée via /setup
@@ -408,7 +441,7 @@ class VintedClient:
             sess = await self._session(domain)
             async with sess.get(f"https://www.vinted.{domain}/api/v2/items/{item_id}",
                                 headers=self._headers(domain), proxy=PROXY,
-                                timeout=aiohttp.ClientTimeout(total=2.5)) as r:
+                                timeout=aiohttp.ClientTimeout(total=6)) as r:
                 if r.status != 200:
                     return None
                 return (await r.json(content_type=None)).get("item")
@@ -421,12 +454,10 @@ class VintedClient:
 
 
 # ───────────────────────── Filtres ─────────────────────────
-def matches(s: dict, kw: str, it: dict) -> bool:
+def basic_ok(s: dict, it: dict) -> bool:
+    """Filtres qui ne dépendent pas des mots-clés (ceux-ci sont vérifiés dans process)."""
     title = norm(it["title"])
     brand = norm(it["brand"])
-    hay = f"{title} {brand}"
-    if STRICT_KEYWORDS and not all(w in hay for w in norm(kw).split()):
-        return False
     if is_excluded(title, brand, s["excluded"]):
         return False
     if it["price"] is not None:
@@ -542,7 +573,7 @@ class PageButton(discord.ui.Button):
 class SalonSelect(discord.ui.Select):
     def __init__(self, salons):
         opts = [discord.SelectOption(label=s["name"][:100], value=str(s["id"]),
-                                     description=(", ".join(s["keywords"]) or "aucun mot-clé")[:100])
+                                     description=(", ".join(s["item_types"] + s["keywords"]) or "aucun mot-clé")[:100])
                 for s in salons]
         super().__init__(placeholder="✏️ Choisir un salon à modifier…", options=opts, row=0)
 
@@ -591,10 +622,13 @@ class NewSalonModal(discord.ui.Modal, title="➕ Nouveau salon"):
         super().__init__()
         self.name_in = discord.ui.TextInput(label="Nom du salon", max_length=50,
                                             placeholder="Ex : Nike Tech")
-        self.kw_in = discord.ui.TextInput(label="Mots-clés (un par ligne)", max_length=300,
+        self.type_in = discord.ui.TextInput(label="Type d'article (ex : doudoune)", max_length=100,
+                                            required=False, placeholder="doudoune")
+        self.kw_in = discord.ui.TextInput(label="Modèles / mots-clés (un par ligne)", max_length=300,
                                           style=discord.TextStyle.paragraph,
                                           placeholder="Ex :\nnike tech\nnike trail")
         self.add_item(self.name_in)
+        self.add_item(self.type_in)
         self.add_item(self.kw_in)
 
     async def on_submit(self, interaction: discord.Interaction):
@@ -622,6 +656,7 @@ class NewSalonModal(discord.ui.Modal, title="➕ Nouveau salon"):
                 "❌ Il me manque des permissions : **Gérer les salons** et **Gérer les webhooks**.", ephemeral=True)
         sid = db.add(user_id=member.id, guild_id=guild.id, name=self.name_in.value.strip(),
                      channel_id=channel.id, webhook_url=wh.url,
+                     item_types=parse_list(self.type_in.value, commas=False),
                      keywords=parse_list(self.kw_in.value, commas=False))
         await channel.send(f"📦 {member.mention} ton salon **{self.name_in.value}** est prêt ! "
                            f"Les annonces correspondantes arriveront ici.")
@@ -638,7 +673,9 @@ def salon_embed(s: dict, created=False):
                        "Les changements sont pris en compte **immédiatement**.")
     pmin = f"{s['price_min']:g} €" if s["price_min"] is not None else "—"
     pmax = f"{s['price_max']:g} €" if s["price_max"] is not None else "—"
-    e.add_field(name="🔎 Mots-clés", value=fmt_lines(s["keywords"], "— (aucun)")[:1000], inline=False)
+    e.add_field(name="👕 Types d'articles", value=fmt_lines(s["item_types"], "— (tous les types)")[:1000],
+                inline=False)
+    e.add_field(name="🔎 Modèles / mots-clés", value=fmt_lines(s["keywords"], "— (aucun)")[:1000], inline=False)
     e.add_field(name="🚫 Exclusions (types d'articles)", value=fmt_lines(s["excluded"])[:1000], inline=False)
     e.add_field(name="💶 Prix", value=f"min {pmin} • max {pmax}", inline=False)
     e.add_field(name="🏷️ Marques", value=fmt_list(s["brands"]), inline=True)
@@ -646,8 +683,8 @@ def salon_embed(s: dict, created=False):
     e.add_field(name="✨ États", value=fmt_list(s["conditions"]), inline=True)
     e.add_field(name="🌍 Pays", value=COUNTRIES.get(s["country"], s["country"]), inline=True)
     e.add_field(name="⏱️ Âge max", value=fmt_age(s.get("max_age")), inline=True)
-    e.set_footer(text="💡 Astuce : un mot-clé par ligne = une recherche chacun. "
-                      "Ex : « nike tech » puis « nike trail » à la ligne.")
+    e.set_footer(text="💡 Ex : type « doudoune » + marque « nike » + modèles « tech fleece » (un par ligne). "
+                      "Tous les mots doivent être dans le titre ou la description.")
     return e
 
 
@@ -682,6 +719,10 @@ class SalonView(discord.ui.View):
     @discord.ui.button(label="🏷️ Marques & tailles", style=discord.ButtonStyle.primary, row=0)
     async def brands(self, interaction: discord.Interaction, _):
         await interaction.response.send_modal(BrandsModal(db.get(self.sid)))
+
+    @discord.ui.button(label="👕 Type", style=discord.ButtonStyle.primary, row=0)
+    async def item_type(self, interaction: discord.Interaction, _):
+        await interaction.response.send_modal(TypeModal(db.get(self.sid)))
 
     @discord.ui.button(label="🚫 Exclure", style=discord.ButtonStyle.primary, row=0)
     async def exclude(self, interaction: discord.Interaction, _):
@@ -778,7 +819,7 @@ class KeywordsModal(discord.ui.Modal, title="✏️ Nom & mots-clés"):
         self.channel_id = s["channel_id"]
         self.name_in = discord.ui.TextInput(label="Nom du salon", max_length=50, default=s["name"])
         self.kw_in = discord.ui.TextInput(
-            label="Mots-clés (un par ligne)", style=discord.TextStyle.paragraph, max_length=500,
+            label="Modèles / mots-clés (un par ligne)", style=discord.TextStyle.paragraph, max_length=500,
             default="\n".join(s["keywords"]), placeholder="nike tech\nnike trail\nnike running")
         for i in (self.name_in, self.kw_in):
             self.add_item(i)
@@ -799,6 +840,22 @@ class KeywordsModal(discord.ui.Modal, title="✏️ Nom & mots-clés"):
             await ch.edit(name=f"{slugify(name)}-{slugify(member.name)}"[:95])
         except Exception:
             pass
+
+
+class TypeModal(discord.ui.Modal, title="👕 Type d'article"):
+    def __init__(self, s):
+        super().__init__()
+        self.sid = s["id"]
+        self.t_in = discord.ui.TextInput(
+            label="Type d'article (un par ligne, vide = tous)", style=discord.TextStyle.paragraph,
+            required=False, max_length=300, default="\n".join(s["item_types"]),
+            placeholder="doudoune\nmanteau")
+        self.add_item(self.t_in)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        db.update(self.sid, item_types=parse_list(self.t_in.value, commas=False))
+        s = db.get(self.sid)
+        await interaction.response.edit_message(embed=salon_embed(s), view=SalonView(s))
 
 
 class ExcludeModal(discord.ui.Modal, title="🚫 Exclure des articles"):
@@ -997,6 +1054,7 @@ class VintedBot(discord.Client):
         self.sent: dict = {}
         self.web_session: aiohttp.ClientSession | None = None
         self.sem = asyncio.Semaphore(12)
+        self.dcache: dict = {}
 
     async def setup_hook(self):
         self.web_session = aiohttp.ClientSession()
@@ -1036,8 +1094,8 @@ class VintedBot(discord.Client):
     async def poll_once(self):
         groups: dict = {}
         for s in db.active():
-            for kw in s["keywords"]:
-                groups.setdefault((s["country"], kw), []).append(s)
+            for q in salon_queries(s):
+                groups.setdefault((s["country"], q), []).append(s)
         if not groups:
             return
         for k in list(self.seen):
@@ -1064,16 +1122,44 @@ class VintedBot(discord.Client):
             for it in new:
                 for s in salons:
                     k = (s["id"], it["id"])
-                    if k not in self.sent and matches(s, key[1], it):
+                    if k not in self.sent and basic_ok(s, it):
                         self.sent[k] = None
-                        tasks.append(self.deliver(s, it))
+                        tasks.append(self.process(s, key[1], it))
         while len(self.sent) > 20000:
             self.sent.pop(next(iter(self.sent)))
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
-    async def deliver(self, s, it):
-        extra = await self.vinted.details(it["domain"], it["id"]) if FETCH_DETAILS else None
+    async def get_details(self, it):
+        """Détails d'une annonce (description…), avec cache pour ne pas les redemander."""
+        cache = self.dcache
+        if it["id"] in cache:
+            return cache[it["id"]]
+        async with self.sem:
+            extra = await self.vinted.details(it["domain"], it["id"])
+        if extra:
+            cache[it["id"]] = extra
+            while len(cache) > 2000:
+                cache.pop(next(iter(cache)))
+        return extra
+
+    async def process(self, s, query, it):
+        """Tous les mots de la recherche doivent être dans le titre/la marque OU dans la description."""
+        hay = f"{norm(it['title'])} {norm(it['brand'])}"
+        extra = None
+        if not words_in(hay, query):
+            if not CHECK_DESCRIPTION:
+                return
+            extra = await self.get_details(it)
+            if not extra:
+                return  # description introuvable : on ne peut pas confirmer, on n'envoie pas
+            if not words_in(f"{hay} {norm(extra.get('description'))}", query):
+                return
+        elif FETCH_DETAILS:
+            extra = await self.get_details(it)
+        await self.deliver(s, it, extra)
+
+    async def deliver(self, s, it, extra=None):
         embeds, view = build_message(s, it, extra)
         wh = discord.Webhook.from_url(s["webhook_url"], session=self.web_session, client=self)
         try:

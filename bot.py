@@ -42,6 +42,9 @@ PAGE_SIZE = 25  # un menu déroulant Discord = 25 choix max -> on pagine
 # Bouton « Rafraîchir » : aucune limite d'annonces. Garde-fou technique uniquement : nombre max de pages
 # Vinted lues par recherche (40 annonces par page) pour ne pas se faire bloquer.
 BACKFILL_MAX_PAGES = int(os.getenv("BACKFILL_MAX_PAGES", "50"))
+# Une annonce n'est « nouvelle » que si son id est proche des plus récents déjà vus (≈ 15 min).
+# Évite d'envoyer de vieilles annonces mises en avant (promues) par Vinted.
+NEW_ID_MARGIN = int(os.getenv("NEW_ID_MARGIN", "300000"))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("vinted")
@@ -1123,6 +1126,7 @@ class VintedBot(discord.Client):
         self.sem = asyncio.Semaphore(12)
         self.dcache: dict = {}
         self.backfilling: set = set()
+        self.maxid: dict = {}
 
     async def setup_hook(self):
         self.web_session = aiohttp.ClientSession()
@@ -1195,6 +1199,7 @@ class VintedBot(discord.Client):
         for k in list(self.seen):
             if k not in groups:
                 del self.seen[k]
+                self.maxid.pop(k, None)
         results = await asyncio.gather(*(self._search(c, kw) for (c, kw) in groups))
         self.polls = getattr(self, "polls", 0) + 1
         if time.time() - getattr(self, "last_hb", 0) > 60:
@@ -1210,8 +1215,11 @@ class VintedBot(discord.Client):
             seen = self.seen.get(key)
             if seen is None:  # première fois : on mémorise sans notifier
                 self.seen[key] = ids
+                self.maxid[key] = max(ids, default=0)
                 continue
-            new = sorted((i for i in items if i["id"] not in seen), key=lambda i: i["id"])
+            floor = self.maxid.get(key, 0) - NEW_ID_MARGIN
+            new = sorted((i for i in items if i["id"] not in seen and i["id"] > floor), key=lambda i: i["id"])
+            self.maxid[key] = max([self.maxid.get(key, 0), *ids])
             self.seen[key] = ids if len(seen) > 5000 else (seen | ids)
             for it in new:
                 for s in salons:

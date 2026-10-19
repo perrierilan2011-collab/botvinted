@@ -66,6 +66,17 @@ def parse_price(text: str):
         return None
 
 
+AGE_OPTIONS = [("Pas de limite", 0), ("30 secondes", 30), ("1 minute", 60), ("2 minutes", 120),
+               ("5 minutes", 300), ("10 minutes", 600), ("30 minutes", 1800), ("1 heure", 3600)]
+
+
+def fmt_age(sec) -> str:
+    for label, v in AGE_OPTIONS:
+        if v == (sec or 0):
+            return label if v else "Pas de limite"
+    return f"{sec} s"
+
+
 def fmt_list(values) -> str:
     return ", ".join(values) if values else "— (tout accepter)"
 
@@ -91,6 +102,10 @@ class DB:
             conditions TEXT DEFAULT '[]',
             price_min REAL, price_max REAL,
             country TEXT DEFAULT 'fr', active INTEGER DEFAULT 1)""")
+        try:
+            self.c.execute("ALTER TABLE salons ADD COLUMN max_age INTEGER DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass  # colonne déjà présente
         self.c.commit()
 
     @staticmethod
@@ -173,6 +188,14 @@ def norm_item(it: dict, domain: str) -> dict:
     if not purl and it.get("photos"):
         first = it["photos"][0]
         purl = (first.get("full_size_url") or first.get("url")) if isinstance(first, dict) else first
+    if not ts:
+        ts = it.get("created_at_ts") or it.get("created_at")
+    try:
+        ts = int(float(ts)) if ts else None
+        if ts and ts > 10**11:      # millisecondes -> secondes
+            ts //= 1000
+    except (TypeError, ValueError):
+        ts = None
     user = it.get("user") or {}
     url = it.get("url") or it.get("path") or f"/items/{it['id']}"
     if url.startswith("/"):
@@ -283,11 +306,13 @@ class VintedClient:
                             self._warn((domain, "fmt"), "Réponse inattendue de %s, clés : %s", url,
                                        list(data.keys()) if isinstance(data, dict) else type(data))
                             return None
+                        normed = [norm_item(i, domain) for i in raw if isinstance(i, dict) and i.get("id")]
                         if domain not in self.ep:
                             self.ep[domain] = idx
                             sample = raw[0] if raw and isinstance(raw[0], dict) else {}
-                            log.info("✅ API Vinted.%s OK via %s | clés d'une annonce : %s", domain, url, sorted(sample.keys()))
-                        return [norm_item(i, domain) for i in raw if isinstance(i, dict) and i.get("id")]
+                            log.info("✅ API Vinted.%s OK via %s | clés d'une annonce : %s | heure de mise en ligne dispo : %s",
+                                     domain, url, sorted(sample.keys()), any(i["ts"] for i in normed))
+                        return normed
                 except Exception as e:
                     self._warn((domain, "exc"), "Erreur requête Vinted « %s » : %s", text, e)
                     break
@@ -330,6 +355,8 @@ def matches(s: dict, kw: str, it: dict) -> bool:
         tokens = set(re.split(r"[\s/,\-]+", size))
         if not any(w == size or w in tokens for w in s["sizes"]):
             return False
+    if s.get("max_age") and it["ts"] and time.time() - it["ts"] > s["max_age"]:
+        return False
     if s["conditions"] and it["status"]:
         if norm(it["status"]) not in {norm(c) for c in s["conditions"]}:
             return False
@@ -492,6 +519,7 @@ def salon_embed(s: dict, created=False):
     e.add_field(name="📏 Tailles", value=fmt_list(s["sizes"]), inline=True)
     e.add_field(name="✨ États", value=fmt_list(s["conditions"]), inline=True)
     e.add_field(name="🌍 Pays", value=COUNTRIES.get(s["country"], s["country"]), inline=True)
+    e.add_field(name="⏱️ Âge max", value=fmt_age(s.get("max_age")), inline=True)
     e.set_footer(text="💡 Astuce : plusieurs mots-clés = plusieurs recherches. "
                       "« nike tech, nike trail » te montre les deux.")
     return e
@@ -505,6 +533,7 @@ class SalonView(discord.ui.View):
         self.toggle.style = discord.ButtonStyle.secondary if s["active"] else discord.ButtonStyle.success
         self.add_item(CondSelect(s))
         self.add_item(CountrySelect(s))
+        self.add_item(AgeSelect(s))
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.owner and not interaction.user.guild_permissions.administrator:
@@ -528,20 +557,20 @@ class SalonView(discord.ui.View):
     async def brands(self, interaction: discord.Interaction, _):
         await interaction.response.send_modal(BrandsModal(db.get(self.sid)))
 
-    @discord.ui.button(label="⏸️", row=3)
+    @discord.ui.button(label="⏸️", row=4)
     async def toggle(self, interaction: discord.Interaction, _):
         s = db.get(self.sid)
         db.update(self.sid, active=0 if s["active"] else 1)
         await self._refresh(interaction)
 
-    @discord.ui.button(label="🗑️ Supprimer", style=discord.ButtonStyle.danger, row=3)
+    @discord.ui.button(label="🗑️ Supprimer", style=discord.ButtonStyle.danger, row=4)
     async def delete(self, interaction: discord.Interaction, _):
         v = ConfirmDelete(self.sid, self.owner)
         e = discord.Embed(title="🗑️ Supprimer ce salon ?", color=0xE74C3C,
                           description="Le salon Discord et ses réglages seront **définitivement supprimés**.")
         await interaction.response.edit_message(embed=e, view=v)
 
-    @discord.ui.button(label="⬅️ Retour", row=3)
+    @discord.ui.button(label="⬅️ Retour", row=4)
     async def back(self, interaction: discord.Interaction, _):
         e, v = main_payload(interaction.user, interaction.guild_id)
         await interaction.response.edit_message(embed=e, view=v)
@@ -593,6 +622,21 @@ class CountrySelect(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction):
         db.update(self.sid, country=self.values[0])
+        s = db.get(self.sid)
+        await interaction.response.edit_message(embed=salon_embed(s), view=SalonView(s))
+
+
+class AgeSelect(discord.ui.Select):
+    def __init__(self, s):
+        self.sid = s["id"]
+        cur = s.get("max_age") or 0
+        opts = [discord.SelectOption(label=("⏱️ " + l) if v else "⏱️ Pas de limite d'âge", value=str(v),
+                                     description=("Annonces postées il y a moins de " + l) if v else "Toutes les nouvelles annonces",
+                                     default=(v == cur)) for l, v in AGE_OPTIONS]
+        super().__init__(placeholder="⏱️ Âge max de l'annonce", options=opts, row=3)
+
+    async def callback(self, interaction: discord.Interaction):
+        db.update(self.sid, max_age=int(self.values[0]))
         s = db.get(self.sid)
         await interaction.response.edit_message(embed=salon_embed(s), view=SalonView(s))
 

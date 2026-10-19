@@ -186,23 +186,34 @@ def norm_item(it: dict, domain: str) -> dict:
 
 
 ENDPOINTS = [
-    "https://www.vinted.{d}/svc-catalogue/items",
+    "https://api.vinted.{d}/svc-catalogue/items",
     "https://api.www.vinted.{d}/svc-catalogue/items",
+    "https://www.vinted.{d}/svc-catalogue/items",
     "https://www.vinted.{d}/api/v2/catalog/items",
 ]
+if os.getenv("VINTED_API_URL"):          # ex : https://api.vinted.{d}/svc-catalogue/items
+    ENDPOINTS.insert(0, os.getenv("VINTED_API_URL"))
 
 
 class VintedClient:
     def __init__(self):
         self.ep: dict = {}
+        self.tokens: dict = {}
         self._lastlog: dict = {}
         self.sessions: dict = {}
         self.locks: dict = {}
         self.cooldown: dict = {}
 
     def _headers(self, domain):
-        return {"User-Agent": UA, "Accept": "application/json, text/plain, */*",
-                "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8", "Referer": f"https://www.vinted.{domain}/"}
+        h = {"User-Agent": UA, "Accept": "application/json, text/plain, */*",
+             "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
+             "Referer": f"https://www.vinted.{domain}/", "Origin": f"https://www.vinted.{domain}"}
+        tok = self.tokens.get(domain, {})
+        if tok.get("anon"):
+            h["X-Anon-Id"] = tok["anon"]
+        if tok.get("csrf"):
+            h["X-CSRF-Token"] = tok["csrf"]
+        return h
 
     async def _session(self, domain) -> aiohttp.ClientSession:
         if domain not in self.sessions:
@@ -219,8 +230,13 @@ class VintedClient:
             try:
                 async with sess.get(f"https://www.vinted.{domain}/", headers=self._headers(domain),
                                     proxy=PROXY, timeout=aiohttp.ClientTimeout(total=10)) as r:
-                    await r.read()
-                    log.info("Cookies Vinted.%s rafraîchis (%s)", domain, r.status)
+                    html = await r.text()
+                    anon = re.search(r'anon_id\\?"\s*:\s*\\?"([0-9a-fA-F-]{20,})', html)
+                    csrf = re.search(r'csrf_token\\?"\s*:\s*\\?"([^"\\]+)', html, re.I)
+                    self.tokens[domain] = {"anon": anon.group(1) if anon else None,
+                                           "csrf": csrf.group(1) if csrf else None}
+                    log.info("Cookies Vinted.%s rafraîchis (%s) | anon_id=%s csrf=%s", domain, r.status,
+                             bool(anon), bool(csrf))
             except Exception as e:
                 log.warning("Refresh cookies %s échoué: %s", domain, e)
 
@@ -250,7 +266,8 @@ class VintedClient:
                             continue
                         if r.status == 404:
                             self.ep.pop(domain, None)
-                            self._warn((domain, idx, 404), "404 sur %s (on essaie une autre adresse)", url)
+                            body = (await r.text())[:100].replace("\n", " ")
+                            self._warn((domain, idx, 404), "404 sur %s → %s", url, body)
                             break
                         if r.status == 429:
                             self.cooldown[domain] = time.time() + 30

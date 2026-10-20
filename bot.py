@@ -14,6 +14,7 @@ Chaque membre crée ses "salons" privés (ex : Nike Tech, Running...) avec ses p
 Chaque salon a son webhook, les annonces arrivent avec photos, infos et bouton Acheter.
 """
 import asyncio
+import collections
 import json
 import logging
 import os
@@ -335,6 +336,57 @@ def extract_items(data):
     return None
 
 
+def canon_status(text):
+    """Reconnaît un état Vinted (français OU anglais) et le ramène au libellé français de CONDITIONS."""
+    t = norm(text)
+    if not t:
+        return None
+    if t.startswith(("neuf avec", "new with", "brand new with")):
+        return CONDITIONS[0]
+    if t.startswith(("neuf sans", "new without", "brand new without")):
+        return CONDITIONS[1]
+    if t in ("tres bon etat", "very good"):
+        return CONDITIONS[2]
+    if t in ("bon etat", "good"):
+        return CONDITIONS[3]
+    if t in ("satisfaisant", "satisfactory"):
+        return CONDITIONS[4]
+    return None
+
+
+def parse_attrs(it: dict):
+    """(marque, taille, état). La nouvelle API les met dans item_box :
+    - first_line = marque (seulement si elle diffère du titre)
+    - second_line = « taille · état » (la taille n'existe que si l'annonce en a une !)
+    - accessibility_label = « …, marque : X, état : Y, taille : Z, prix… » (le plus explicite)
+    On lit donc par CONTENU (un état connu est l'état, le reste est la taille), jamais par position."""
+    brand = it.get("brand_title") or ""
+    size = it.get("size_title") or ""
+    status = canon_status(it.get("status")) or ""
+    box = it.get("item_box") or {}
+    label = box.get("accessibility_label") or ""
+    if label:
+        def grab(*names):
+            m = re.search(r"(?:" + "|".join(names) + r")\s*:\s*([^,]+)", label, re.I)
+            return m.group(1).strip() if m else ""
+        brand = brand or grab("brand", "marque")
+        size = size or grab("size", "taille")
+        status = status or canon_status(grab("condition", "état", "etat")) or ""
+    for part in re.split(r"[·•|]", box.get("second_line") or ""):
+        part = part.strip()
+        if not part:
+            continue
+        c = canon_status(part)
+        if c:
+            status = status or c
+        elif not size:
+            size = re.sub(r"^(?:taille|size)\s*:?\s*", "", part, flags=re.I)
+    first = (box.get("first_line") or "").strip()
+    if not brand and first and norm(first) != norm(it.get("title")):
+        brand = first
+    return brand, size, status
+
+
 def norm_item(it: dict, domain: str) -> dict:
     price = it.get("price")
     if isinstance(price, dict):
@@ -364,22 +416,13 @@ def norm_item(it: dict, domain: str) -> dict:
     except (TypeError, ValueError):
         ts = None
     user = it.get("user") or {}
-    box = it.get("item_box") or {}
-    brand = it.get("brand_title") or box.get("first_line") or ""
-    size, status = it.get("size_title") or "", it.get("status") or ""
-    second = box.get("second_line") or ""
-    if second and (not size or not status):  # ex : « M · Très bon état »
-        parts = [p.strip() for p in re.split(r"[·•|]", second) if p.strip()]
-        if not size and parts:
-            size = parts[0]
-        if not status and len(parts) > 1:
-            status = parts[-1]
+    brand, size, status = parse_attrs(it)
     url = it.get("url") or it.get("path") or f"/items/{it['id']}"
     if url.startswith("/"):
         url = f"https://www.vinted.{domain}{url}"
     return {
         "id": int(it["id"]), "title": it.get("title") or "", "price": amount, "currency": cur,
-        "brand": brand, "size": size,
+        "brand": brand, "size": size, "box": (it.get("item_box") or {}),
         "status": status, "url": url, "photo": purl, "ts": ts,
         "seller": user.get("login"),
         "seller_url": user.get("profile_url") or (f"https://www.vinted.{domain}/member/{user['id']}" if user.get("id") else None),
@@ -562,6 +605,7 @@ class VintedClient:
                          domain, len(normed), sorted(sample.keys()), any(i["ts"] for i in normed))
                 if normed:
                     log.info("Exemple lu : %s", {k: normed[0][k] for k in ("id", "title", "price", "brand", "size", "status")})
+                    log.info("item_box brut : %s", json.dumps(normed[0].get("box"), ensure_ascii=False)[:400])
             return normed
         return None
 
@@ -580,30 +624,32 @@ class VintedClient:
 
 
 # ───────────────────────── Filtres ─────────────────────────
-def basic_ok(s: dict, it: dict) -> bool:
-    """Filtres qui ne dépendent pas des mots-clés (ceux-ci sont vérifiés dans process)."""
+def filter_reason(s: dict, it: dict):
+    """None si l'annonce passe tous les filtres du salon, sinon la raison du rejet."""
     title = norm(it["title"])
     brand = norm(it["brand"])
     if is_excluded(title, brand, s["excluded"]):
-        return False
+        return "exclu"
     if it["price"] is not None:
         if s["price_min"] is not None and it["price"] < s["price_min"]:
-            return False
+            return "prix"
         if s["price_max"] is not None and it["price"] > s["price_max"]:
-            return False
-    if s["brands"] and not any(b in norm(it["brand"]) or b in title for b in s["brands"]):
-        return False
+            return "prix"
+    if s["brands"] and not any(b in brand or b in title for b in s["brands"]):
+        return "marque"
     if s["sizes"]:
         size = norm(it["size"])
-        tokens = set(re.split(r"[\s/,\-]+", size))
+        tokens = {t for t in re.split(r"[\s/,\-–—·]+", size) if t}
         if not any(w == size or w in tokens for w in s["sizes"]):
-            return False
-    if s.get("max_age") and it["ts"] and time.time() - it["ts"] > s["max_age"]:
-        return False
-    if s["conditions"] and it["status"]:
+            return "taille"  # taille différente OU annonce sans taille
+    if s["conditions"]:
         if norm(it["status"]) not in {norm(c) for c in s["conditions"]}:
-            return False
-    return True
+            return "état"
+    return None
+
+
+def basic_ok(s: dict, it: dict) -> bool:
+    return filter_reason(s, it) is None
 
 
 # ───────────────────────── Message d'annonce ─────────────────────────
@@ -1225,6 +1271,9 @@ class VintedBot(discord.Client):
         self.maxid: dict = {}
         self.watchers: dict = {}
         self.groups: dict = {}
+        self.id_hist = collections.deque(maxlen=4000)  # (heure, plus grand id Vinted vu) -> « horloge » des ids
+        self.gmax = 0
+        self.rejects = collections.Counter()
         self.scans = self.scans_ok = self.total_sent = 0
         self.last_hb = 0.0
 
@@ -1277,6 +1326,9 @@ class VintedBot(discord.Client):
                     self.last_hb = time.time()
                     log.info("❤️ %s mot(s)-clé(s) surveillé(s) en continu | %s/%s requêtes OK | %s annonces envoyées",
                              len(self.watchers), self.scans_ok, self.scans, self.total_sent)
+                    if self.rejects:
+                        log.info("Filtres : annonces écartées depuis 1 min → %s", dict(self.rejects))
+                        self.rejects.clear()
                     self.scans = self.scans_ok = 0
             except Exception:
                 log.exception("Erreur superviseur")
@@ -1296,6 +1348,36 @@ class VintedBot(discord.Client):
                 log.exception("Erreur veilleur %s", key)
             await asyncio.sleep(max(0.3, interval() - (time.monotonic() - t0)) + random.uniform(0, 0.4))
 
+    # --- fraîcheur des annonces ---
+    # Les ids Vinted augmentent avec le temps. On note régulièrement le plus grand id vu (tous mots-clés confondus) :
+    # une annonce n'a que X secondes si son id est plus grand que le plus grand id qui existait il y a X secondes.
+    def note_ids(self, ids):
+        if not ids:
+            return
+        self.gmax = max(self.gmax, max(ids))
+        now = time.time()
+        if not self.id_hist or now - self.id_hist[-1][0] >= 1.5:
+            self.id_hist.append((now, self.gmax))
+
+    def id_floor(self, max_age):
+        """Plus petit id exclu : toute annonce avec un id <= floor est plus vieille que max_age (0 = marge par défaut)."""
+        if not self.id_hist:
+            return None
+        if not max_age:
+            return self.gmax - NEW_ID_MARGIN
+        cutoff = time.time() - max_age
+        for t, m in reversed(self.id_hist):
+            if t <= cutoff:
+                return m
+        return self.id_hist[0][1]  # historique plus court que la durée : seules les annonces apparues depuis le démarrage
+
+    def is_recent(self, it, max_age):
+        """Vrai si l'annonce est assez récente pour la durée choisie dans le salon."""
+        if max_age and it.get("ts") and time.time() - it["ts"] > max(max_age, 600):
+            return False  # l'heure de la photo dit clairement « vieux » (marge : la photo est postée avant l'annonce)
+        floor = self.id_floor(max_age)
+        return floor is None or it["id"] > floor
+
     async def scan(self, key):
         """Une lecture de la recherche : mémorise la 1re fois, ensuite envoie uniquement les NOUVELLES annonces."""
         country, query = key
@@ -1308,20 +1390,24 @@ class VintedBot(discord.Client):
         seen = self.seen.get(key)
         if seen is None:  # première lecture : on mémorise l'existant, sans rien envoyer
             self.seen[key] = ids
-            self.maxid[key] = max(ids, default=0)
+            self.note_ids(ids)
             return
-        # « nouvelle » = jamais vue ET id proche des plus récents (écarte les vieilles annonces remontées/promues)
-        floor = self.maxid.get(key, 0) - NEW_ID_MARGIN
-        new = sorted((i for i in items if i["id"] not in seen and i["id"] > floor), key=lambda i: i["id"])
-        self.maxid[key] = max([self.maxid.get(key, 0), *ids])
+        # « nouvelle » = jamais vue (puis, par salon : assez récente pour la durée choisie)
+        new = sorted((i for i in items if i["id"] not in seen), key=lambda i: i["id"])
         self.seen[key] = ids if len(seen) > 5000 else (seen | ids)
+        self.note_ids(ids)
         tasks = []
         for it in new:
             for s in self.groups.get(key, []):
                 k = (s["id"], it["id"])
-                if k not in self.sent and basic_ok(s, it):
-                    self.sent[k] = None
-                    tasks.append(self.process(s, query, it))
+                if k in self.sent or not self.is_recent(it, s.get("max_age")):
+                    continue
+                why = filter_reason(s, it)
+                if why:
+                    self.rejects[why] += 1
+                    continue
+                self.sent[k] = None
+                tasks.append(self.process(s, query, it))
         while len(self.sent) > 20000:
             self.sent.pop(next(iter(self.sent)))
         if tasks:
@@ -1352,8 +1438,9 @@ class VintedBot(discord.Client):
             if len(items) < PER_PAGE:
                 break  # dernière page
             if max_age:
-                ts = await self.item_ts(min(items, key=lambda i: i["id"]))
-                if ts and now - ts > max_age:
+                self.note_ids([i["id"] for i in items])
+                floor = self.id_floor(max_age)
+                if floor is not None and min(i["id"] for i in items) <= floor:
                     break  # on est déjà remonté plus loin que la durée choisie
         return out
 
@@ -1418,25 +1505,10 @@ class VintedBot(discord.Client):
                     if it["id"] not in cands and basic_ok(s, it):
                         cands[it["id"]] = (q, it)
             newest = sorted(cands.values(), key=lambda c: c[1]["id"], reverse=True)
+            for _, items in zip(queries, results):
+                self.note_ids([i["id"] for i in items or []])
             if s.get("max_age"):
-                kept, now, unknown = [], time.time(), 0
-                for i in range(0, len(newest), 20):  # du plus récent au plus ancien, par paquets
-                    batch = newest[i:i + 20]
-                    stamps = await asyncio.gather(*(self.item_ts(it) for _, it in batch))
-                    too_old = False
-                    for c, ts in zip(batch, stamps):
-                        if ts is None:
-                            unknown += 1
-                        if ts and now - ts > s["max_age"]:
-                            too_old = True
-                        else:
-                            kept.append(c)
-                    if too_old:
-                        break  # les ids suivants sont encore plus anciens
-                if unknown:
-                    log.warning("Salon %s : heure de mise en ligne introuvable pour %s annonce(s), filtre d'âge impossible pour elles",
-                                s["name"], unknown)
-                newest = kept
+                newest = [c for c in newest if self.is_recent(c[1], s["max_age"])]
             checks = await asyncio.gather(*(self.check(q, it) for q, it in newest))
             keep = [(it, extra) for (q, it), (ok, extra) in zip(newest, checks) if ok]
             if clear:

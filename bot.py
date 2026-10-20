@@ -364,18 +364,31 @@ def norm_item(it: dict, domain: str) -> dict:
     except (TypeError, ValueError):
         ts = None
     user = it.get("user") or {}
+    box = it.get("item_box") or {}
+    brand = it.get("brand_title") or box.get("first_line") or ""
+    size, status = it.get("size_title") or "", it.get("status") or ""
+    second = box.get("second_line") or ""
+    if second and (not size or not status):  # ex : « M · Très bon état »
+        parts = [p.strip() for p in re.split(r"[·•|]", second) if p.strip()]
+        if not size and parts:
+            size = parts[0]
+        if not status and len(parts) > 1:
+            status = parts[-1]
     url = it.get("url") or it.get("path") or f"/items/{it['id']}"
     if url.startswith("/"):
         url = f"https://www.vinted.{domain}{url}"
     return {
         "id": int(it["id"]), "title": it.get("title") or "", "price": amount, "currency": cur,
-        "brand": it.get("brand_title") or "", "size": it.get("size_title") or "",
-        "status": it.get("status") or "", "url": url, "photo": purl, "ts": ts,
-        "seller": user.get("login"), "seller_url": user.get("profile_url"), "domain": domain,
+        "brand": brand, "size": size,
+        "status": status, "url": url, "photo": purl, "ts": ts,
+        "seller": user.get("login"),
+        "seller_url": user.get("profile_url") or (f"https://www.vinted.{domain}/member/{user['id']}" if user.get("id") else None),
+        "domain": domain,
     }
 
 
-API_URL = os.getenv("VINTED_API_URL") or "https://www.vinted.{d}/api/v2/catalog/items"
+API_URL = os.getenv("VINTED_API_URL") or "https://api.vinted.{d}/svc-catalogue/items"
+TOKEN_TTL = 25 * 60  # le token anonyme dure ~2 h ; on le renouvelle bien avant
 
 
 class VintedClient:
@@ -392,6 +405,7 @@ class VintedClient:
         self.cooldown: dict = {}
         self.proxy_i = 0
         self.ok_logged: set = set()
+        self.token_at: dict = {}
 
     def _proxy(self):
         return PROXIES[self.proxy_i % len(PROXIES)] if PROXIES else None
@@ -407,6 +421,8 @@ class VintedClient:
         if CurlSession is None:
             h["User-Agent"] = UA
         tok = self.tokens.get(domain, {})
+        if tok.get("bearer"):
+            h["Authorization"] = f"Bearer {tok['bearer']}"
         if tok.get("anon"):
             h["X-Anon-Id"] = tok["anon"]
         if tok.get("csrf"):
@@ -418,17 +434,35 @@ class VintedClient:
             return CurlSession(impersonate="chrome")
         return aiohttp.ClientSession(cookie_jar=aiohttp.CookieJar())
 
-    async def _get(self, domain, url, params=None, timeout=8):
-        """GET -> (status, texte). Même interface avec curl_cffi ou aiohttp."""
+    async def _get(self, domain, url, params=None, timeout=8, method="GET"):
+        """Requête -> (status, texte). Même interface avec curl_cffi ou aiohttp."""
         sess = self.sessions[domain]
         proxy = self._proxy()
         if CurlSession is not None:
-            r = await sess.get(url, params=params, headers=self._headers(domain), timeout=timeout,
-                               proxies={"http": proxy, "https": proxy} if proxy else None)
-            return r.status_code, r.text
-        async with sess.get(url, params=params, headers=self._headers(domain), proxy=proxy,
-                            timeout=aiohttp.ClientTimeout(total=timeout)) as r:
-            return r.status, await r.text()
+            r = await sess.request(method, url, params=params, headers=self._headers(domain), timeout=timeout,
+                                   proxies={"http": proxy, "https": proxy} if proxy else None)
+            return r.status_code, ("" if method == "HEAD" else r.text)
+        async with sess.request(method, url, params=params, headers=self._headers(domain), proxy=proxy,
+                                timeout=aiohttp.ClientTimeout(total=timeout)) as r:
+            return r.status, ("" if method == "HEAD" else await r.text())
+
+    def _cookie(self, domain, name):
+        """Lit un cookie de la session (access_token_web = token anonyme utilisé en Bearer)."""
+        sess = self.sessions[domain]
+        try:
+            if CurlSession is not None:
+                val = None
+                for c in sess.cookies.jar:  # on garde le dernier non vide
+                    if c.name == name and c.value:
+                        val = c.value
+                return val
+            val = None
+            for c in sess.cookie_jar:
+                if c.key == name and c.value:
+                    val = c.value
+            return val
+        except Exception:
+            return None
 
     async def _session(self, domain):
         if domain not in self.sessions:
@@ -438,7 +472,7 @@ class VintedClient:
         return self.sessions[domain]
 
     async def refresh(self, domain):
-        """Visite la page d'accueil comme un navigateur pour obtenir les cookies de session."""
+        """Comme un navigateur : charge /catalog pour obtenir le token anonyme (cookie access_token_web)."""
         lock = self.locks.setdefault(domain, asyncio.Lock())
         if lock.locked():  # un autre veilleur est déjà en train de le faire : on attend juste
             async with lock:
@@ -446,14 +480,22 @@ class VintedClient:
         async with lock:
             if domain not in self.sessions:
                 return
+            tok = self.tokens.setdefault(domain, {})
             try:
-                status, html = await self._get(domain, f"https://www.vinted.{domain}/", timeout=12)
-                anon = re.search(r'anon_id\\?"\s*:\s*\\?"([0-9a-fA-F-]{20,})', html)
-                csrf = re.search(r'csrf_token\\?"\s*:\s*\\?"([^"\\]+)', html, re.I)
-                self.tokens[domain] = {"anon": anon.group(1) if anon else None,
-                                       "csrf": csrf.group(1) if csrf else None}
-                log.info("Session Vinted.%s initialisée (HTTP %s, moteur=%s)", domain, status,
-                         "curl_cffi/Chrome" if CurlSession else "aiohttp")
+                status, _ = await self._get(domain, f"https://www.vinted.{domain}/catalog", timeout=12, method="HEAD")
+                bearer = self._cookie(domain, "access_token_web")
+                anon = csrf = None
+                if not bearer or status >= 400:  # repli : la page d'accueil complète
+                    status, html = await self._get(domain, f"https://www.vinted.{domain}/", timeout=12)
+                    bearer = self._cookie(domain, "access_token_web") or bearer
+                    m = re.search(r'anon_id\\?"\s*:\s*\\?"([0-9a-fA-F-]{20,})', html)
+                    anon = m.group(1) if m else None
+                    m = re.search(r'csrf_token\\?"\s*:\s*\\?"([^"\\]+)', html, re.I)
+                    csrf = m.group(1) if m else None
+                tok.update({"bearer": bearer, "anon": anon or tok.get("anon"), "csrf": csrf or tok.get("csrf")})
+                self.token_at[domain] = time.time()
+                log.info("Session Vinted.%s initialisée (HTTP %s, token=%s, moteur=%s)", domain, status,
+                         "OK" if bearer else "ABSENT", "curl_cffi/Chrome" if CurlSession else "aiohttp")
                 if status in (403, 429):
                     self._rotate_proxy()
             except Exception as e:
@@ -475,7 +517,10 @@ class VintedClient:
         except Exception as e:
             self._warn((domain, "sess"), "Session Vinted.%s impossible: %s", domain, e)
             return None
-        params = {"search_text": text, "order": "newest_first", "per_page": str(per_page), "page": str(page)}
+        if time.time() - self.token_at.get(domain, 0) > TOKEN_TTL:
+            await self.refresh(domain)
+        params = {"search_text": text, "order": "newest_first", "per_page": str(per_page), "page": str(page),
+                  "time": str(int(time.time()))}
         url = API_URL.format(d=domain)
         for attempt in range(2):
             try:
@@ -493,8 +538,9 @@ class VintedClient:
                 log.warning("Rate limit sur vinted.%s, pause 30 s (augmente POLL_INTERVAL ou ajoute des proxys)", domain)
                 return None
             if status != 200:
-                self._warn((domain, status), "Vinted.%s a répondu HTTP %s%s", domain, status,
-                           " : IP bloquée → mets un proxy résidentiel dans PROXY" if status in (401, 403) else "")
+                self._warn((domain, status), "Vinted.%s a répondu HTTP %s sur %s%s", domain, status, url,
+                           " : IP bloquée → mets un proxy résidentiel dans PROXY" if status in (401, 403) else
+                           (" : endpoint introuvable (Vinted a encore changé son API ?)" if status == 404 else ""))
                 if status in (401, 403):
                     self._rotate_proxy()
                 return None
@@ -512,21 +558,16 @@ class VintedClient:
             if domain not in self.ok_logged:
                 self.ok_logged.add(domain)
                 sample = raw[0] if raw and isinstance(raw[0], dict) else {}
-                log.info("✅ API Vinted.%s OK | clés d'une annonce : %s | heure de mise en ligne dispo : %s",
-                         domain, sorted(sample.keys()), any(i["ts"] for i in normed))
+                log.info("✅ API Vinted.%s OK | %s annonces | clés d'une annonce : %s | heure de mise en ligne dispo : %s",
+                         domain, len(normed), sorted(sample.keys()), any(i["ts"] for i in normed))
+                if normed:
+                    log.info("Exemple lu : %s", {k: normed[0][k] for k in ("id", "title", "price", "brand", "size", "status")})
             return normed
         return None
 
     async def details(self, domain, item_id):
-        """Fiche détaillée (description, photos). Souvent bloquée par Vinted : jamais indispensable."""
-        try:
-            await self._session(domain)
-            status, body = await self._get(domain, f"https://www.vinted.{domain}/api/v2/items/{item_id}", timeout=6)
-            if status != 200:
-                return None
-            return json.loads(body).get("item")
-        except Exception:
-            return None
+        """Vinted a supprimé l'API de détail d'une annonce (sept. 2026) : on ne la demande plus."""
+        return None
 
     async def close(self):
         for s in self.sessions.values():

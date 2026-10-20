@@ -1,6 +1,9 @@
 """
 Bot Vinted -> Discord
 
+Surveillance : 1 veilleur permanent par ligne de mots-clés (comme la barre de recherche Vinted, tri « plus récent »).
+Seules les NOUVELLES annonces dont le titre contient tous les mots de la ligne sont envoyées.
+
 - /setup   (owner/admin)  : menu de configuration (rôles Owner / VIP / Premium+, limite VIP)
                             + bouton pour poster le panneau public dans un salon
 - /vip     (rôle VIP)     : gérer ses salons Vinted, avec une LIMITE de salons (réglable dans /setup)
@@ -14,6 +17,7 @@ import asyncio
 import json
 import logging
 import os
+import random
 import re
 import sqlite3
 import time
@@ -24,20 +28,35 @@ import discord
 from discord import app_commands
 from dotenv import load_dotenv
 
+try:  # empreinte TLS de vrai Chrome : c'est ce qui évite les 403 de Vinted (pip install curl_cffi)
+    from curl_cffi.requests import AsyncSession as CurlSession
+except ImportError:  # repli sur aiohttp (plus souvent bloqué)
+    CurlSession = None
+
 load_dotenv()
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 GUILD_ID = int(os.getenv("GUILD_ID") or 0)
+# Pause entre deux vérifications d'UN MÊME mot-clé (chaque ligne de mots-clés a son propre veilleur)
 POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "3"))
-PROXY = os.getenv("PROXY") or None
+# Un ou plusieurs proxys séparés par des virgules (rotation automatique si Vinted bloque l'un d'eux)
+PROXIES = [p.strip() for p in (os.getenv("PROXY") or "").split(",") if p.strip()]
+# Nombre max de requêtes Vinted simultanées
+MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "8"))
+# Garde-fou anti-ban : écart minimum moyen entre 2 requêtes Vinted (s). Si tu as beaucoup de mots-clés,
+# l'intervalle de chaque veilleur est automatiquement rallongé (nb de mots-clés × MIN_REQ_GAP).
+MIN_REQ_GAP = float(os.getenv("MIN_REQ_GAP", "0.35"))
+# Annonces lues à chaque vérification (les plus récentes). 30 suffit largement pour du temps réel.
+POLL_PER_PAGE = int(os.getenv("POLL_PER_PAGE", "30"))
+PER_PAGE = 40  # pages complètes (bouton Rafraîchir)
 # Limite VIP par défaut (modifiable ensuite dans /setup, par serveur)
 DEFAULT_VIP_LIMIT = int(os.getenv("MAX_SALONS_PER_USER", "5"))
 CATEGORY_NAME = os.getenv("CATEGORY_NAME", "🛒 Vinted")
 DB_PATH = os.getenv("DB_PATH", "vinted_bot.db")
 FETCH_DETAILS = os.getenv("FETCH_DETAILS", "0") == "1"
-# 1 (défaut) = si un mot de la recherche n'est pas dans le titre, on lit la description de l'annonce.
-# 0 = on ne regarde que le titre et la marque (plus rapide, moins d'appels à Vinted).
-CHECK_DESCRIPTION = os.getenv("CHECK_DESCRIPTION", "1") == "1"
+# 0 (défaut) = les mots-clés doivent être dans le TITRE (ou la marque). Fiable et instantané.
+# 1 = si un mot manque dans le titre, on lit aussi la description (l'endpoint détail de Vinted est souvent bloqué).
+CHECK_DESCRIPTION = os.getenv("CHECK_DESCRIPTION", "0") == "1"
 PAGE_SIZE = 25  # un menu déroulant Discord = 25 choix max -> on pagine
 # Bouton « Rafraîchir » : aucune limite d'annonces. Garde-fou technique uniquement : nombre max de pages
 # Vinted lues par recherche (40 annonces par page) pour ne pas se faire bloquer.
@@ -356,29 +375,37 @@ def norm_item(it: dict, domain: str) -> dict:
     }
 
 
-ENDPOINTS = [
-    "https://api.vinted.{d}/svc-catalogue/items",
-    "https://api.www.vinted.{d}/svc-catalogue/items",
-    "https://www.vinted.{d}/svc-catalogue/items",
-    "https://www.vinted.{d}/api/v2/catalog/items",
-]
-if os.getenv("VINTED_API_URL"):  # ex : https://api.vinted.{d}/svc-catalogue/items
-    ENDPOINTS.insert(0, os.getenv("VINTED_API_URL"))
+API_URL = os.getenv("VINTED_API_URL") or "https://www.vinted.{d}/api/v2/catalog/items"
 
 
 class VintedClient:
+    """Même requête que la barre de recherche du site : /api/v2/catalog/items?search_text=...&order=newest_first
+    - cookies de session (access_token_web) récupérés sur la page d'accueil, renouvelés automatiquement
+    - empreinte TLS Chrome via curl_cffi (sinon repli aiohttp)
+    - rotation de proxy si Vinted renvoie 403/429"""
+
     def __init__(self):
-        self.ep: dict = {}
         self.tokens: dict = {}
         self._lastlog: dict = {}
         self.sessions: dict = {}
         self.locks: dict = {}
         self.cooldown: dict = {}
+        self.proxy_i = 0
+        self.ok_logged: set = set()
+
+    def _proxy(self):
+        return PROXIES[self.proxy_i % len(PROXIES)] if PROXIES else None
+
+    def _rotate_proxy(self):
+        if len(PROXIES) > 1:
+            self.proxy_i += 1
+            log.info("Rotation de proxy → #%s", self.proxy_i % len(PROXIES) + 1)
 
     def _headers(self, domain):
-        h = {"User-Agent": UA, "Accept": "application/json, text/plain, */*",
-             "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
+        h = {"Accept": "application/json, text/plain, */*", "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
              "Referer": f"https://www.vinted.{domain}/", "Origin": f"https://www.vinted.{domain}"}
+        if CurlSession is None:
+            h["User-Agent"] = UA
         tok = self.tokens.get(domain, {})
         if tok.get("anon"):
             h["X-Anon-Id"] = tok["anon"]
@@ -386,30 +413,51 @@ class VintedClient:
             h["X-CSRF-Token"] = tok["csrf"]
         return h
 
-    async def _session(self, domain) -> aiohttp.ClientSession:
+    def _new_session(self):
+        if CurlSession is not None:
+            return CurlSession(impersonate="chrome")
+        return aiohttp.ClientSession(cookie_jar=aiohttp.CookieJar())
+
+    async def _get(self, domain, url, params=None, timeout=8):
+        """GET -> (status, texte). Même interface avec curl_cffi ou aiohttp."""
+        sess = self.sessions[domain]
+        proxy = self._proxy()
+        if CurlSession is not None:
+            r = await sess.get(url, params=params, headers=self._headers(domain), timeout=timeout,
+                               proxies={"http": proxy, "https": proxy} if proxy else None)
+            return r.status_code, r.text
+        async with sess.get(url, params=params, headers=self._headers(domain), proxy=proxy,
+                            timeout=aiohttp.ClientTimeout(total=timeout)) as r:
+            return r.status, await r.text()
+
+    async def _session(self, domain):
         if domain not in self.sessions:
-            self.sessions[domain] = aiohttp.ClientSession(cookie_jar=aiohttp.CookieJar())
+            self.sessions[domain] = self._new_session()
             self.locks[domain] = asyncio.Lock()
             await self.refresh(domain)
         return self.sessions[domain]
 
     async def refresh(self, domain):
-        """Récupère les cookies de session nécessaires à l'API."""
+        """Visite la page d'accueil comme un navigateur pour obtenir les cookies de session."""
         lock = self.locks.setdefault(domain, asyncio.Lock())
+        if lock.locked():  # un autre veilleur est déjà en train de le faire : on attend juste
+            async with lock:
+                return
         async with lock:
-            sess = self.sessions[domain]
+            if domain not in self.sessions:
+                return
             try:
-                async with sess.get(f"https://www.vinted.{domain}/", headers=self._headers(domain),
-                                    proxy=PROXY, timeout=aiohttp.ClientTimeout(total=10)) as r:
-                    html = await r.text()
-                    anon = re.search(r'anon_id\\?"\s*:\s*\\?"([0-9a-fA-F-]{20,})', html)
-                    csrf = re.search(r'csrf_token\\?"\s*:\s*\\?"([^"\\]+)', html, re.I)
-                    self.tokens[domain] = {"anon": anon.group(1) if anon else None,
-                                           "csrf": csrf.group(1) if csrf else None}
-                    log.info("Cookies Vinted.%s rafraîchis (%s) | anon_id=%s csrf=%s", domain, r.status,
-                             bool(anon), bool(csrf))
+                status, html = await self._get(domain, f"https://www.vinted.{domain}/", timeout=12)
+                anon = re.search(r'anon_id\\?"\s*:\s*\\?"([0-9a-fA-F-]{20,})', html)
+                csrf = re.search(r'csrf_token\\?"\s*:\s*\\?"([^"\\]+)', html, re.I)
+                self.tokens[domain] = {"anon": anon.group(1) if anon else None,
+                                       "csrf": csrf.group(1) if csrf else None}
+                log.info("Session Vinted.%s initialisée (HTTP %s, moteur=%s)", domain, status,
+                         "curl_cffi/Chrome" if CurlSession else "aiohttp")
+                if status in (403, 429):
+                    self._rotate_proxy()
             except Exception as e:
-                log.warning("Refresh cookies %s échoué: %s", domain, e)
+                log.warning("Initialisation session %s échouée: %s", domain, e)
 
     def _warn(self, key, msg, *args):
         """Évite de spammer les logs : 1 message identique toutes les 30 s."""
@@ -418,69 +466,76 @@ class VintedClient:
             self._lastlog[key] = now
             log.warning(msg, *args)
 
-    async def search(self, domain, text, page=1):
+    async def search(self, domain, text, page=1, per_page=PER_PAGE):
+        """Équivalent de taper `text` dans la barre de recherche Vinted, triée par plus récent."""
         if time.time() < self.cooldown.get(domain, 0):
             return None
-        sess = await self._session(domain)
-        params = {"search_text": text, "order": "newest_first", "per_page": "40", "page": str(page)}
-        order = [self.ep[domain]] if domain in self.ep else range(len(ENDPOINTS))
-        refreshed = False
-        for idx in order:
-            url = ENDPOINTS[idx].format(d=domain)
-            for _ in range(2):
-                try:
-                    async with sess.get(url, params=params, headers=self._headers(domain), proxy=PROXY,
-                                        timeout=aiohttp.ClientTimeout(total=8)) as r:
-                        if r.status in (401, 403) and not refreshed:
-                            refreshed = True
-                            await self.refresh(domain)
-                            continue
-                        if r.status == 404:
-                            self.ep.pop(domain, None)
-                            body = (await r.text())[:100].replace("\n", " ")
-                            self._warn((domain, idx, 404), "404 sur %s → %s", url, body)
-                            break
-                        if r.status == 429:
-                            self.cooldown[domain] = time.time() + 30
-                            log.warning("Rate limit sur vinted.%s, pause 30s (monte POLL_INTERVAL ou utilise un proxy)", domain)
-                            return None
-                        if r.status != 200:
-                            self._warn((domain, r.status), "Vinted.%s a répondu HTTP %s (%s)%s", domain, r.status, url,
-                                       " : IP probablement bloquée, utilise un proxy" if r.status in (401, 403) else "")
-                            return None
-                        data = await r.json(content_type=None)
-                        raw = extract_items(data)
-                        if raw is None:
-                            self._warn((domain, "fmt"), "Réponse inattendue de %s, clés : %s", url,
-                                       list(data.keys()) if isinstance(data, dict) else type(data))
-                            return None
-                        normed = [norm_item(i, domain) for i in raw if isinstance(i, dict) and i.get("id")]
-                        if domain not in self.ep:
-                            self.ep[domain] = idx
-                            sample = raw[0] if raw and isinstance(raw[0], dict) else {}
-                            log.info("✅ API Vinted.%s OK via %s | clés d'une annonce : %s | heure de mise en ligne dispo : %s",
-                                     domain, url, sorted(sample.keys()), any(i["ts"] for i in normed))
-                        return normed
-                except Exception as e:
-                    self._warn((domain, "exc"), "Erreur requête Vinted « %s » : %s", text, e)
-                    break
+        try:
+            await self._session(domain)
+        except Exception as e:
+            self._warn((domain, "sess"), "Session Vinted.%s impossible: %s", domain, e)
+            return None
+        params = {"search_text": text, "order": "newest_first", "per_page": str(per_page), "page": str(page)}
+        url = API_URL.format(d=domain)
+        for attempt in range(2):
+            try:
+                status, body = await self._get(domain, url, params)
+            except Exception as e:
+                self._warn((domain, "exc"), "Erreur requête Vinted « %s » : %s", text, e)
+                self._rotate_proxy()
+                return None
+            if status in (401, 403) and attempt == 0:
+                await self.refresh(domain)  # cookie expiré -> on le renouvelle et on retente
+                continue
+            if status == 429:
+                self.cooldown[domain] = time.time() + 30
+                self._rotate_proxy()
+                log.warning("Rate limit sur vinted.%s, pause 30 s (augmente POLL_INTERVAL ou ajoute des proxys)", domain)
+                return None
+            if status != 200:
+                self._warn((domain, status), "Vinted.%s a répondu HTTP %s%s", domain, status,
+                           " : IP bloquée → mets un proxy résidentiel dans PROXY" if status in (401, 403) else "")
+                if status in (401, 403):
+                    self._rotate_proxy()
+                return None
+            try:
+                data = json.loads(body)
+            except ValueError:
+                self._warn((domain, "json"), "Réponse non-JSON de Vinted.%s (page de protection anti-bot ?)", domain)
+                return None
+            raw = extract_items(data)
+            if raw is None:
+                self._warn((domain, "fmt"), "Réponse inattendue de Vinted, clés : %s",
+                           list(data.keys()) if isinstance(data, dict) else type(data))
+                return None
+            normed = [norm_item(i, domain) for i in raw if isinstance(i, dict) and i.get("id")]
+            if domain not in self.ok_logged:
+                self.ok_logged.add(domain)
+                sample = raw[0] if raw and isinstance(raw[0], dict) else {}
+                log.info("✅ API Vinted.%s OK | clés d'une annonce : %s | heure de mise en ligne dispo : %s",
+                         domain, sorted(sample.keys()), any(i["ts"] for i in normed))
+            return normed
         return None
 
     async def details(self, domain, item_id):
+        """Fiche détaillée (description, photos). Souvent bloquée par Vinted : jamais indispensable."""
         try:
-            sess = await self._session(domain)
-            async with sess.get(f"https://www.vinted.{domain}/api/v2/items/{item_id}",
-                                headers=self._headers(domain), proxy=PROXY,
-                                timeout=aiohttp.ClientTimeout(total=6)) as r:
-                if r.status != 200:
-                    return None
-                return (await r.json(content_type=None)).get("item")
+            await self._session(domain)
+            status, body = await self._get(domain, f"https://www.vinted.{domain}/api/v2/items/{item_id}", timeout=6)
+            if status != 200:
+                return None
+            return json.loads(body).get("item")
         except Exception:
             return None
 
     async def close(self):
         for s in self.sessions.values():
-            await s.close()
+            try:
+                r = s.close()
+                if asyncio.iscoroutine(r):
+                    await r
+            except Exception:
+                pass
 
 
 # ───────────────────────── Filtres ─────────────────────────
@@ -1123,10 +1178,14 @@ class VintedBot(discord.Client):
         self.seen: dict = {}
         self.sent: dict = {}
         self.web_session: aiohttp.ClientSession | None = None
-        self.sem = asyncio.Semaphore(12)
+        self.sem = asyncio.Semaphore(MAX_CONCURRENCY)
         self.dcache: dict = {}
         self.backfilling: set = set()
         self.maxid: dict = {}
+        self.watchers: dict = {}
+        self.groups: dict = {}
+        self.scans = self.scans_ok = self.total_sent = 0
+        self.last_hb = 0.0
 
     async def setup_hook(self):
         self.web_session = aiohttp.ClientSession()
@@ -1140,6 +1199,8 @@ class VintedBot(discord.Client):
         self.loop.create_task(self.poll_loop())
 
     async def close(self):
+        for t in self.watchers.values():
+            t.cancel()
         await self.vinted.close()
         if self.web_session:
             await self.web_session.close()
@@ -1148,20 +1209,86 @@ class VintedBot(discord.Client):
     async def on_ready(self):
         log.info("Connecté en tant que %s", self.user)
 
-    # --- boucle de surveillance ---
+    # --- surveillance continue : 1 « veilleur » par ligne de mots-clés ---
+    def build_groups(self) -> dict:
+        """(pays, recherche) -> salons concernés. Une même recherche partagée par plusieurs salons n'est faite qu'une fois."""
+        groups: dict = {}
+        for s in db.active():
+            for q in salon_queries(s):
+                groups.setdefault((s["country"], q), []).append(s)
+        return groups
+
     async def poll_loop(self):
+        """Superviseur : lance un veilleur par recherche, arrête ceux devenus inutiles (salon supprimé/modifié)."""
         await self.wait_until_ready()
         while not self.is_closed():
+            try:
+                self.groups = self.build_groups()
+                for key in self.groups:
+                    t = self.watchers.get(key)
+                    if t is None or t.done():
+                        self.watchers[key] = asyncio.create_task(self.watch(key))
+                for key in [k for k in self.watchers if k not in self.groups]:
+                    self.watchers.pop(key).cancel()
+                    self.seen.pop(key, None)
+                    self.maxid.pop(key, None)
+                if time.time() - self.last_hb > 60:
+                    self.last_hb = time.time()
+                    log.info("❤️ %s mot(s)-clé(s) surveillé(s) en continu | %s/%s requêtes OK | %s annonces envoyées",
+                             len(self.watchers), self.scans_ok, self.scans, self.total_sent)
+                    self.scans = self.scans_ok = 0
+            except Exception:
+                log.exception("Erreur superviseur")
+            await asyncio.sleep(2)
+
+    async def watch(self, key):
+        """Veilleur d'UNE recherche : relit sans arrêt la même recherche Vinted (plus récent en premier)."""
+        interval = lambda: max(POLL_INTERVAL, len(self.groups) * MIN_REQ_GAP)
+        await asyncio.sleep(random.uniform(0, interval()))  # étale les veilleurs dans le temps
+        while True:
             t0 = time.monotonic()
             try:
-                await self.poll_once()
+                await self.scan(key)
+            except asyncio.CancelledError:
+                raise
             except Exception:
-                log.exception("Erreur dans la boucle")
-            await asyncio.sleep(max(0.2, POLL_INTERVAL - (time.monotonic() - t0)))
+                log.exception("Erreur veilleur %s", key)
+            await asyncio.sleep(max(0.3, interval() - (time.monotonic() - t0)) + random.uniform(0, 0.4))
 
-    async def _search(self, domain, kw, page=1):
+    async def scan(self, key):
+        """Une lecture de la recherche : mémorise la 1re fois, ensuite envoie uniquement les NOUVELLES annonces."""
+        country, query = key
+        items = await self._search(country, query, 1, POLL_PER_PAGE)
+        self.scans += 1
+        if items is None:
+            return
+        self.scans_ok += 1
+        ids = {i["id"] for i in items}
+        seen = self.seen.get(key)
+        if seen is None:  # première lecture : on mémorise l'existant, sans rien envoyer
+            self.seen[key] = ids
+            self.maxid[key] = max(ids, default=0)
+            return
+        # « nouvelle » = jamais vue ET id proche des plus récents (écarte les vieilles annonces remontées/promues)
+        floor = self.maxid.get(key, 0) - NEW_ID_MARGIN
+        new = sorted((i for i in items if i["id"] not in seen and i["id"] > floor), key=lambda i: i["id"])
+        self.maxid[key] = max([self.maxid.get(key, 0), *ids])
+        self.seen[key] = ids if len(seen) > 5000 else (seen | ids)
+        tasks = []
+        for it in new:
+            for s in self.groups.get(key, []):
+                k = (s["id"], it["id"])
+                if k not in self.sent and basic_ok(s, it):
+                    self.sent[k] = None
+                    tasks.append(self.process(s, query, it))
+        while len(self.sent) > 20000:
+            self.sent.pop(next(iter(self.sent)))
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _search(self, domain, kw, page=1, per_page=PER_PAGE):
         async with self.sem:
-            return await self.vinted.search(domain, kw, page)
+            return await self.vinted.search(domain, kw, page, per_page)
 
     async def item_ts(self, it):
         """Heure de mise en ligne : celle de la recherche, sinon lue dans la fiche de l'annonce."""
@@ -1181,56 +1308,13 @@ class VintedBot(discord.Client):
             if items is None:
                 return out or None
             out.extend(items)
-            if len(items) < 40:
+            if len(items) < PER_PAGE:
                 break  # dernière page
             if max_age:
                 ts = await self.item_ts(min(items, key=lambda i: i["id"]))
                 if ts and now - ts > max_age:
                     break  # on est déjà remonté plus loin que la durée choisie
         return out
-
-    async def poll_once(self):
-        groups: dict = {}
-        for s in db.active():
-            for q in salon_queries(s):
-                groups.setdefault((s["country"], q), []).append(s)
-        if not groups:
-            return
-        for k in list(self.seen):
-            if k not in groups:
-                del self.seen[k]
-                self.maxid.pop(k, None)
-        results = await asyncio.gather(*(self._search(c, kw) for (c, kw) in groups))
-        self.polls = getattr(self, "polls", 0) + 1
-        if time.time() - getattr(self, "last_hb", 0) > 60:
-            self.last_hb = time.time()
-            ok = sum(1 for r in results if r is not None)
-            log.info("❤️ Scan #%s : %s recherche(s) actives, %s réponse(s) OK, %s annonces envoyées au total",
-                     self.polls, len(groups), ok, getattr(self, "total_sent", 0))
-        tasks = []
-        for (key, salons), items in zip(groups.items(), results):
-            if items is None:
-                continue
-            ids = {i["id"] for i in items}
-            seen = self.seen.get(key)
-            if seen is None:  # première fois : on mémorise sans notifier
-                self.seen[key] = ids
-                self.maxid[key] = max(ids, default=0)
-                continue
-            floor = self.maxid.get(key, 0) - NEW_ID_MARGIN
-            new = sorted((i for i in items if i["id"] not in seen and i["id"] > floor), key=lambda i: i["id"])
-            self.maxid[key] = max([self.maxid.get(key, 0), *ids])
-            self.seen[key] = ids if len(seen) > 5000 else (seen | ids)
-            for it in new:
-                for s in salons:
-                    k = (s["id"], it["id"])
-                    if k not in self.sent and basic_ok(s, it):
-                        self.sent[k] = None
-                        tasks.append(self.process(s, key[1], it))
-        while len(self.sent) > 20000:
-            self.sent.pop(next(iter(self.sent)))
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def get_details(self, it):
         """Détails d'une annonce (description…), avec cache pour ne pas les redemander."""
@@ -1337,7 +1421,7 @@ class VintedBot(discord.Client):
                 raise
             except Exception:
                 await wh.send(embeds=embeds, username="Vinted Bot")  # sans boutons si non supporté
-            self.total_sent = getattr(self, "total_sent", 0) + 1
+            self.total_sent += 1
             log.info("→ %s : %s (%s)", s["name"], it["title"], it["url"])
         except discord.NotFound:
             log.warning("Webhook introuvable pour le salon %s, désactivé.", s["name"])

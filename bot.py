@@ -430,7 +430,11 @@ def norm_item(it: dict, domain: str) -> dict:
     }
 
 
-API_URL = os.getenv("VINTED_API_URL") or "https://api.vinted.{d}/svc-catalogue/items"
+# Équivalent « données » de la page https://www.vinted.fr/catalog?order=newest_first&search_text=... :
+# on essaie les endpoints dans l'ordre et on garde le premier qui répond (404 -> endpoint suivant).
+API_URLS = [u for u in (os.getenv("VINTED_API_URL"),
+                        "https://api.vinted.{d}/svc-catalogue/items",
+                        "https://www.vinted.{d}/api/v2/catalog/items") if u]
 TOKEN_TTL = 25 * 60  # le token anonyme dure ~2 h ; on le renouvelle bien avant
 
 
@@ -449,6 +453,7 @@ class VintedClient:
         self.proxy_i = 0
         self.ok_logged: set = set()
         self.token_at: dict = {}
+        self.api_idx: dict = {}
 
     def _proxy(self):
         return PROXIES[self.proxy_i % len(PROXIES)] if PROXIES else None
@@ -562,10 +567,14 @@ class VintedClient:
             return None
         if time.time() - self.token_at.get(domain, 0) > TOKEN_TTL:
             await self.refresh(domain)
-        params = {"search_text": text, "order": "newest_first", "per_page": str(per_page), "page": str(page),
-                  "time": str(int(time.time()))}
-        url = API_URL.format(d=domain)
-        for attempt in range(2):
+        # Mêmes paramètres que l'URL du site : catalog?order=newest_first&page=1&search_by_image_uuid=
+        # &search_by_image_id=&time=...&search_text=<mots-clés>  (search_text = la ligne de mots-clés du salon)
+        params = {"order": "newest_first", "page": str(page), "per_page": str(per_page),
+                  "search_by_image_uuid": "", "search_by_image_id": "",
+                  "time": str(int(time.time())), "search_text": text}
+        idx = self.api_idx.get(domain, 0) % len(API_URLS)
+        url = API_URLS[idx].format(d=domain)
+        for attempt in range(3):
             try:
                 status, body = await self._get(domain, url, params)
             except Exception as e:
@@ -574,6 +583,12 @@ class VintedClient:
                 return None
             if status in (401, 403) and attempt == 0:
                 await self.refresh(domain)  # cookie expiré -> on le renouvelle et on retente
+                continue
+            if status == 404 and attempt < len(API_URLS) - 1:
+                self.api_idx[domain] = (idx + 1) % len(API_URLS)
+                idx = self.api_idx[domain]
+                url = API_URLS[idx].format(d=domain)
+                log.info("Endpoint introuvable, essai de : %s", url)
                 continue
             if status == 429:
                 self.cooldown[domain] = time.time() + 30

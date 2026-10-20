@@ -65,6 +65,9 @@ BACKFILL_MAX_PAGES = int(os.getenv("BACKFILL_MAX_PAGES", "50"))
 # Une annonce n'est « nouvelle » que si son id est proche des plus récents déjà vus (≈ 15 min).
 # Évite d'envoyer de vieilles annonces mises en avant (promues) par Vinted.
 NEW_ID_MARGIN = int(os.getenv("NEW_ID_MARGIN", "300000"))
+# Verrou anti-anciennes annonces : au démarrage on mémorise le plus grand id déjà en ligne pour chaque recherche.
+# Ensuite SEULES les annonces avec un id plus grand sont envoyées (≈ 3 000 ids ≈ 10 s de tolérance).
+BASELINE_MARGIN = int(os.getenv("BASELINE_MARGIN", "3000"))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("vinted")
@@ -1403,12 +1406,18 @@ class VintedBot(discord.Client):
         self.scans_ok += 1
         ids = {i["id"] for i in items}
         seen = self.seen.get(key)
+        if seen is None and not ids:
+            return  # recherche vide : on réessaie, pour ne pas tout considérer comme « nouveau » ensuite
         if seen is None:  # première lecture : on mémorise l'existant, sans rien envoyer
             self.seen[key] = ids
+            self.maxid[key] = max(ids) if ids else 0
             self.note_ids(ids)
+            log.info("Veille démarrée « %s » (%s) : %s annonces existantes ignorées, j'envoie uniquement les suivantes",
+                     query, country, len(ids))
             return
-        # « nouvelle » = jamais vue (puis, par salon : assez récente pour la durée choisie)
-        new = sorted((i for i in items if i["id"] not in seen), key=lambda i: i["id"])
+        # « nouvelle » = jamais vue ET id plus grand que tout ce qui existait au démarrage
+        base = self.maxid.get(key, 0) - BASELINE_MARGIN
+        new = sorted((i for i in items if i["id"] not in seen and i["id"] > base), key=lambda i: i["id"])
         self.seen[key] = ids if len(seen) > 5000 else (seen | ids)
         self.note_ids(ids)
         tasks = []

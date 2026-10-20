@@ -427,6 +427,7 @@ def norm_item(it: dict, domain: str) -> dict:
         "id": int(it["id"]), "title": it.get("title") or "", "price": amount, "currency": cur,
         "brand": brand, "size": size, "box": (it.get("item_box") or {}),
         "status": status, "url": url, "photo": purl, "ts": ts,
+        "views": it.get("view_count"), "favs": it.get("favourite_count"),
         "seller": user.get("login"),
         "seller_url": user.get("profile_url") or (f"https://www.vinted.{domain}/member/{user['id']}" if user.get("id") else None),
         "domain": domain,
@@ -438,6 +439,14 @@ def norm_item(it: dict, domain: str) -> dict:
 API_URLS = [u for u in (os.getenv("VINTED_API_URL"),
                         "https://api.vinted.{d}/svc-catalogue/items",
                         "https://www.vinted.{d}/api/v2/catalog/items") if u]
+# Variantes de paramètres de tri testées au démarrage : on garde celle qui renvoie VRAIMENT les annonces
+# de la plus récente à la plus ancienne (Vinted ignore parfois un paramètre sans erreur).
+SORT_VARIANTS = [
+    {"order": "newest_first", "search_by_image_uuid": "", "search_by_image_id": ""},
+    {"order": "newest_first"},
+    {"sort": "newest_first"},
+    {"order": "newest_first", "sort": "newest_first", "sort_by": "newest_first"},
+]
 TOKEN_TTL = 25 * 60  # le token anonyme dure ~2 h ; on le renouvelle bien avant
 
 
@@ -457,6 +466,9 @@ class VintedClient:
         self.ok_logged: set = set()
         self.token_at: dict = {}
         self.api_idx: dict = {}
+        self.variant: dict = {}     # domaine -> (endpoint, paramètres de tri validés)
+        self.sorted_ok: dict = {}   # domaine -> True si le tri « plus récent » est confirmé
+        self.cal_locks: dict = {}
 
     def _proxy(self):
         return PROXIES[self.proxy_i % len(PROXIES)] if PROXIES else None
@@ -559,6 +571,69 @@ class VintedClient:
             self._lastlog[key] = now
             log.warning(msg, *args)
 
+    @staticmethod
+    def newest_first(raw):
+        """True si les annonces (hors « mises en avant ») arrivent de la plus récente à la plus ancienne."""
+        ids = []
+        for i in raw:
+            if isinstance(i, dict) and i.get("id") and not i.get("promoted"):
+                try:
+                    ids.append(int(i["id"]))
+                except (TypeError, ValueError):
+                    pass
+        if len(ids) < 8:
+            return None
+        good = sum(1 for a, b in zip(ids, ids[1:]) if a > b)
+        return good / (len(ids) - 1) >= 0.9
+
+    async def _calibrate(self, domain):
+        """Teste endpoints × paramètres de tri sur une recherche large (« nike ») et garde la combinaison
+        qui renvoie les annonces triées par date. Sans ça, Vinted renvoie un ordre quelconque et le bot
+        croit que de vieilles annonces sont « nouvelles »."""
+        lock = self.cal_locks.setdefault(domain, asyncio.Lock())
+        async with lock:
+            if domain in self.variant:
+                return
+            first_ok = None
+            for url_t in API_URLS:
+                for extra in SORT_VARIANTS:
+                    params = {"page": "1", "per_page": "30", "time": str(int(time.time())),
+                              "search_text": "nike", **extra}
+                    url = url_t.format(d=domain)
+                    try:
+                        status, body = await self._get(domain, url, params)
+                        if status in (401, 403):
+                            await self.refresh(domain)
+                            status, body = await self._get(domain, url, params)
+                        if status == 429:
+                            self.cooldown[domain] = time.time() + 30
+                            return
+                        if status != 200:
+                            continue
+                        raw = extract_items(json.loads(body))
+                    except Exception:
+                        continue
+                    if not raw:
+                        continue
+                    verdict = self.newest_first(raw)
+                    ids = [i.get("id") for i in raw[:6] if isinstance(i, dict)]
+                    log.info("Test du tri Vinted.%s | %s | %s → %s | 6 premiers ids : %s", domain,
+                             url, extra,
+                             "TRIÉ ✅" if verdict else ("non trié ❌" if verdict is False else "indécis"), ids)
+                    if first_ok is None:
+                        first_ok = (url_t, extra)
+                    if verdict:
+                        self.variant[domain] = (url_t, extra)
+                        self.sorted_ok[domain] = True
+                        log.info("✅ Tri « plus récent » confirmé sur Vinted.%s avec %s %s", domain, url_t, extra)
+                        return
+            if first_ok:
+                self.variant[domain] = first_ok
+                self.sorted_ok[domain] = False
+                log.warning("⚠️ Aucune variante ne renvoie les annonces triées par date sur Vinted.%s. "
+                            "Mode prudent activé (filtre sur le nombre de vues). Envoie-moi les lignes « Test du tri ».",
+                            domain)
+
     async def search(self, domain, text, page=1, per_page=PER_PAGE):
         """Équivalent de taper `text` dans la barre de recherche Vinted, triée par plus récent."""
         if time.time() < self.cooldown.get(domain, 0):
@@ -570,14 +645,16 @@ class VintedClient:
             return None
         if time.time() - self.token_at.get(domain, 0) > TOKEN_TTL:
             await self.refresh(domain)
-        # Mêmes paramètres que l'URL du site : catalog?order=newest_first&page=1&search_by_image_uuid=
-        # &search_by_image_id=&time=...&search_text=<mots-clés>  (search_text = la ligne de mots-clés du salon)
-        params = {"order": "newest_first", "page": str(page), "per_page": str(per_page),
-                  "search_by_image_uuid": "", "search_by_image_id": "",
-                  "time": str(int(time.time())), "search_text": text}
-        idx = self.api_idx.get(domain, 0) % len(API_URLS)
-        url = API_URLS[idx].format(d=domain)
-        for attempt in range(3):
+        if domain not in self.variant:
+            await self._calibrate(domain)
+            if domain not in self.variant:
+                return None
+        url_t, extra = self.variant[domain]
+        # Mêmes paramètres que l'URL du site : catalog?order=newest_first&page=1&time=...&search_text=<mots-clés>
+        params = {"page": str(page), "per_page": str(per_page), "time": str(int(time.time())),
+                  "search_text": text, **extra}
+        url = url_t.format(d=domain)
+        for attempt in range(2):
             try:
                 status, body = await self._get(domain, url, params)
             except Exception as e:
@@ -586,12 +663,6 @@ class VintedClient:
                 return None
             if status in (401, 403) and attempt == 0:
                 await self.refresh(domain)  # cookie expiré -> on le renouvelle et on retente
-                continue
-            if status == 404 and attempt < len(API_URLS) - 1:
-                self.api_idx[domain] = (idx + 1) % len(API_URLS)
-                idx = self.api_idx[domain]
-                url = API_URLS[idx].format(d=domain)
-                log.info("Endpoint introuvable, essai de : %s", url)
                 continue
             if status == 429:
                 self.cooldown[domain] = time.time() + 30
@@ -1417,7 +1488,9 @@ class VintedBot(discord.Client):
             return
         # « nouvelle » = jamais vue ET id plus grand que tout ce qui existait au démarrage
         base = self.maxid.get(key, 0) - BASELINE_MARGIN
-        new = sorted((i for i in items if i["id"] not in seen and i["id"] > base), key=lambda i: i["id"])
+        careful = self.vinted.sorted_ok.get(country) is False  # tri non confirmé -> on écarte les annonces déjà vues par du monde
+        new = sorted((i for i in items if i["id"] not in seen and i["id"] > base
+                      and not (careful and (i.get("views") or 0) > 3)), key=lambda i: i["id"])
         self.seen[key] = ids if len(seen) > 5000 else (seen | ids)
         self.note_ids(ids)
         tasks = []
@@ -1549,6 +1622,9 @@ class VintedBot(discord.Client):
             self.backfilling.discard(sid)
 
     async def deliver(self, s, it, extra=None):
+        cur = db.get(s["id"])
+        if not cur or not cur.get("active"):
+            return  # salon supprimé/désactivé entre-temps (webhook introuvable) : on n'insiste pas
         embeds, view = build_message(s, it, extra)
         wh = discord.Webhook.from_url(s["webhook_url"], session=self.web_session, client=self)
         try:
